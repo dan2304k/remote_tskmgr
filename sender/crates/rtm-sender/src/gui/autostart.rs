@@ -205,6 +205,8 @@ mod tests {
     use super::xdg::*;
     use super::*;
 
+    // Unix-style absolute paths; the XDG logic is only used on Linux.
+    #[cfg(unix)]
     #[test]
     fn autostart_dir_resolution() {
         let o = |s: &str| Some(OsString::from(s));
