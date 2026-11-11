@@ -1,0 +1,4 @@
+{
+  "_comment": "v must be 1.",
+  "v": 2, "id": "x", "host": "h", "os": "linux", "ts": 0, "seq": 0, "interval_ms": 1000, "metrics": {}
+}

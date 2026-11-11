@@ -1,0 +1,4 @@
+{
+  "_comment": "metrics is required.",
+  "v": 1, "id": "x", "host": "h", "os": "linux", "ts": 0, "seq": 0, "interval_ms": 1000
+}

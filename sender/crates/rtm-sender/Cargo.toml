@@ -1,0 +1,45 @@
+[package]
+name = "rtm-sender"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RTM sender daemon: samples system stats and sends them to viewers"
+
+[[bin]]
+name = "rtm-sender"
+path = "src/main.rs"
+
+[features]
+default = []
+# Tray icon + egui settings window. Linux needs libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxkbcommon-dev.
+gui = ["dep:tray-icon", "dep:eframe", "dep:image", "dep:gtk", "dep:windows-sys", "dep:winreg"]
+
+[dependencies]
+rtm-protocol = { path = "../rtm-protocol" }
+rtm-collect = { path = "../rtm-collect" }
+rtm-net = { path = "../rtm-net" }
+rtm-config = { path = "../rtm-config" }
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+notify.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+ctrlc.workspace = true
+tray-icon = { version = "0.26", optional = true }
+# glow renderer only (no wgpu): much smaller binary, plenty for a settings form.
+eframe = { version = "0.37", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "clipboard"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+
+# gui feature: the tray runs on its own thread with a GTK main loop (Linux) or a Win32 message
+# pump (Windows). gtk and windows-sys are the versions tray-icon itself uses.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+winreg = { version = "0.56", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

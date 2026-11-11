@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rtm.local/schema/packet.v1.json",
+  "title": "RTM packet v1",
+  "type": "object",
+  "required": ["v", "id", "host", "os", "ts", "seq", "interval_ms", "metrics"],
+  "properties": {
+    "v": { "const": 1 },
+    "id": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "host": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "os": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+    "ts": { "type": "integer", "minimum": 0 },
+    "seq": { "type": "integer", "minimum": 0 },
+    "interval_ms": { "type": "integer", "minimum": 100 },
+    "auth": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "metrics": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]*$" },
+      "additionalProperties": { "$ref": "#/$defs/metric" }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "metric": {
+      "type": "object",
+      "required": ["v", "unit", "label"],
+      "properties": {
+        "v": { "type": ["number", "null"] },
+        "unit": { "type": "string", "maxLength": 8 },
+        "label": { "type": "string", "minLength": 1, "maxLength": 12 },
+        "min": { "type": "number" },
+        "max": { "type": ["number", "null"] },
+        "detail": { "type": "object" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

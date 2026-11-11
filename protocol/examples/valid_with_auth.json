@@ -1,0 +1,18 @@
+{
+  "_comment": "Valid auth computed with secret 'correct horse' over this whole object minus auth (unknown keys such as _comment ARE part of the hashed body).",
+  "v": 1,
+  "id": "auth-box",
+  "host": "secure",
+  "os": "windows",
+  "ts": 1762640003000,
+  "seq": 1,
+  "interval_ms": 1000,
+  "metrics": {
+    "cpu": {
+      "v": 10.0,
+      "unit": "%",
+      "label": "CPU"
+    }
+  },
+  "auth": "0a2fbe3180d92083d961ccb1dc43d3ee17b4dc007dbde1e1ca11b0665644dce2"
+}

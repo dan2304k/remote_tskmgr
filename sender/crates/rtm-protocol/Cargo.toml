@@ -1,0 +1,15 @@
+[package]
+name = "rtm-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RTM wire protocol v1 types and validation (no I/O)"
+
+[dependencies]
+serde.workspace = true
+# float_roundtrip: exact f64 parsing, otherwise re-parsed packets can fail HMAC verification.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+thiserror.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true

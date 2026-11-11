@@ -1,0 +1,21 @@
+# systemd user unit for the RTM sender.
+# Install: see packaging/README.md. Config: ~/.config/rtm/sender.toml (hot reloaded).
+[Unit]
+Description=RTM sender (pushes system stats to RTM viewers on the LAN)
+Documentation=https://github.com/dan2304k/remote_tskmgr
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/rtm-sender
+Environment=RTM_LOG=info
+Restart=on-failure
+RestartSec=5
+# Ctrl-C equivalent; the sender handles SIGTERM and exits cleanly.
+KillSignal=SIGTERM
+TimeoutStopSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target

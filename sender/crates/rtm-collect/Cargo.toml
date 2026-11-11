@@ -1,0 +1,24 @@
+[package]
+name = "rtm-collect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Metric collectors for the RTM sender"
+
+[features]
+default = ["nvml"]
+nvml = ["dep:nvml-wrapper"]
+
+[dependencies]
+rtm-protocol = { path = "../rtm-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+sysinfo.workspace = true
+nvml-wrapper = { version = "0.13", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_System_Performance", "Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_System_Registry"] }

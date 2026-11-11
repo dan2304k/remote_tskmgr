@@ -1,0 +1,10 @@
+{
+  "_comment": "Unknown top-level and metric-level fields plus a custom metric; all must parse.",
+  "v": 1, "id": "custom", "host": "homelab", "os": "linux", "ts": 1762640002000, "seq": 99, "interval_ms": 15000,
+  "future_field": { "anything": true },
+  "metrics": {
+    "cpu": { "v": 88.8, "unit": "%", "label": "CPU", "extra": "ignored" },
+    "fan_rpm": { "v": 1450, "unit": "rpm", "label": "FAN", "min": 0, "max": 3000 },
+    "battery": { "v": 72, "unit": "%", "label": "BAT", "detail": { "charging": false, "minutes_left": 190 } }
+  }
+}

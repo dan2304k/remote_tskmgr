@@ -1,0 +1,11 @@
+{
+  "_comment": "Intel iGPU on Linux: utilisation unknown, value null, frequency in detail, approx flag.",
+  "v": 1, "id": "intel-box", "host": "nuc", "os": "linux", "ts": 1762640001000, "seq": 7, "interval_ms": 5000,
+  "metrics": {
+    "cpu": { "v": 3.0, "unit": "%", "label": "CPU", "min": 0, "max": 100 },
+    "gpu": { "v": null, "unit": "%", "label": "GPU", "min": 0, "max": 100,
+             "detail": { "name": "Intel HD Graphics 630", "freq_mhz": 350, "max_freq_mhz": 1150, "backend": "intel-sysfs", "approx": true } },
+    "mem": { "v": 41.2, "unit": "%", "label": "MEM", "min": 0, "max": 100, "detail": { "used_mb": 13500, "total_mb": 32768 } },
+    "disk": { "v": 0.0, "unit": "MB/s", "label": "DISK", "min": 0, "max": null, "detail": { "read_mbps": 0.0, "write_mbps": 0.0 } }
+  }
+}

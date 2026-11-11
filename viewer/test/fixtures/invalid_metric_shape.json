@@ -1,0 +1,5 @@
+{
+  "_comment": "A metric must be an object with unit and label; a bare number is invalid.",
+  "v": 1, "id": "x", "host": "h", "os": "linux", "ts": 0, "seq": 0, "interval_ms": 1000,
+  "metrics": { "cpu": 55 }
+}

@@ -1,0 +1,4 @@
+{
+  "_comment": "Smallest legal packet: no metrics at all.",
+  "v": 1, "id": "min", "host": "h", "os": "windows", "ts": 0, "seq": 0, "interval_ms": 1000, "metrics": {}
+}

@@ -1,0 +1,29 @@
+# Rust
+sender/target/
+**/*.rs.bk
+# Flutter / Dart
+viewer/.dart_tool/
+viewer/.flutter-plugins*
+viewer/.packages
+viewer/build/
+viewer/android/.gradle/
+viewer/android/local.properties
+viewer/android/app/.cxx/
+viewer/ios/Pods/
+viewer/ios/.symlinks/
+viewer/ios/Flutter/ephemeral/
+viewer/linux/flutter/ephemeral/
+viewer/macos/Flutter/ephemeral/
+viewer/windows/flutter/ephemeral/
+*.iml
+.idea/
+# misc
+*.log
+.DS_Store
+__pycache__/
+
+# build outputs
+dist/
+
+# local planning notes, not published
+PLAN.md

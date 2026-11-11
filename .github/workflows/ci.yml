@@ -1,0 +1,39 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  sender:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    defaults: { run: { working-directory: sender } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxkbcommon-dev
+      - run: cargo test --workspace
+      - run: cargo build --release --features gui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtm-sender-${{ runner.os }}
+          path: |
+            sender/target/release/rtm-sender
+            sender/target/release/rtm-sender.exe
+  viewer:
+    runs-on: ubuntu-24.04
+    defaults: { run: { working-directory: viewer } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+      - uses: subosito/flutter-action@v2
+        with: { channel: stable }
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+      - run: flutter build apk --debug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtm-viewer-debug.apk
+          path: viewer/build/app/outputs/flutter-apk/app-debug.apk
