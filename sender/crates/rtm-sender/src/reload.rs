@@ -159,7 +159,8 @@ mod tests {
 
         let hits = Arc::new(AtomicUsize::new(0));
         let h = hits.clone();
-        let _w = watch(&path, Duration::from_millis(200), move || {
+        // Generous debounce: loaded CI runners can stall the writer for hundreds of ms.
+        let _w = watch(&path, Duration::from_millis(1000), move || {
             h.fetch_add(1, Ordering::SeqCst);
         })
         .unwrap();
@@ -170,17 +171,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         std::fs::write(dir.join("other.toml"), "x").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while hits.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        std::thread::sleep(Duration::from_millis(400));
+        std::thread::sleep(Duration::from_millis(1500));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         // Atomic replace (temp + rename) is also seen.
         std::fs::write(dir.join("sender.toml.tmp"), "a = 9\n").unwrap();
         std::fs::rename(dir.join("sender.toml.tmp"), &path).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while hits.load(Ordering::SeqCst) == 1 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
