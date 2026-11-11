@@ -41,8 +41,10 @@ Download from the latest [release](../../releases/latest):
 | `rtm-sender-gui-linux-x86_64` | Linux desktops: tray icon + settings window. Needs GTK 3 and libayatana-appindicator3 installed, even when run with `--no-gui` |
 | `rtm-sender-windows-x86_64.zip` | Windows: `rtm-sender.exe` (tray + settings) with `install.bat` / `uninstall.bat` |
 | `rtm-sender-windows-x86_64.exe` | Windows: the same exe on its own (run it in place) |
+| `rtm-sender-setup.exe` | Windows: Inno Setup installer for the same exe (per-user or all users, optional start at login) |
+| `SHA256SUMS` | SHA-256 of every asset: `sha256sum -c SHA256SUMS --ignore-missing` |
 
-Or build (Rust stable, 1.95+ for the GUI):
+Or build (Rust stable: 1.89+ headless, 1.95+ for the GUI):
 ```
 sender\build.bat            # Windows: tray + settings build -> dist\windows-x86_64\rtm-sender.exe (+ install.bat, uninstall.bat)
 sender/build.sh             # Linux/macOS: same -> dist/<os>-<arch>/rtm-sender
@@ -69,8 +71,12 @@ Linux `~/.config/rtm/sender.toml`, Windows `%APPDATA%\rtm\sender.toml`. Every ke
 see `sender/crates/rtm-sender/README.md` for details.
 
 Install on Windows: `dist\windows-x86_64\install.bat` (per-user, no admin) or `install.bat /system`;
-`packaging/windows/rtm-sender.iss` builds a setup.exe with Inno Setup. Linux: `packaging/README.md` has the
+or run `rtm-sender-setup.exe` (built from `packaging/windows/rtm-sender.iss` with Inno Setup). Linux: `packaging/README.md` has the
 systemd user unit. Or tick "Start at login" in the GUI settings on either OS (it shows the installer's registration too).
+
+Only one sender runs per config file: a second copy exits with "already running" (exit code 3).
+The tray build also logs to `sender.log` next to `sender.toml` (tray menu → "Open log file"); on Windows
+a start-up error is shown in a message box.
 
 ### 2. Viewer on the phone
 
@@ -116,7 +122,7 @@ cd viewer && dart format --output=none --set-exit-if-changed lib test && flutter
 ```
 CI (`.github/workflows/ci.yml`) runs all of these on every branch push (Linux + Windows for the
 sender, with and without `gui`) and uploads the sender binaries and the debug APK. Tags `v*` publish
-the release assets listed above plus `rtm-viewer.apk` (`release.yml`).
+the release assets listed above plus `rtm-viewer.apk` and `SHA256SUMS` (`release.yml`), once every build has succeeded.
 
 License: MIT.
 

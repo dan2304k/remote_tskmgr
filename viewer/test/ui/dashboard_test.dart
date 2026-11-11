@@ -199,8 +199,8 @@ void main() {
         ],
       );
       h.config.showDetails = true;
-      h.config.ensureSlot('net', isPercent: false);
-      h.config.ensureSlot('uptime', isPercent: false);
+      h.config.ensureSlot('net');
+      h.config.ensureSlot('uptime');
       h.config.setSlotStyle('mem', TileStyle.bar);
       h.config.setSlotStyle('disk', TileStyle.sparkline);
       for (final d in GridDensity.values) {

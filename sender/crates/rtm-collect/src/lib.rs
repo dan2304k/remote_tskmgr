@@ -83,7 +83,7 @@ impl std::str::FromStr for GpuBackend {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CollectorConfig {
     /// Metric keys to enable, in packet order. Known: cpu, gpu, mem, disk, net, temp, load, uptime.
     pub enabled: Vec<String>,
@@ -93,6 +93,28 @@ pub struct CollectorConfig {
     pub gpu_adapter: String,
     /// Disk names to include (empty = all physical disks).
     pub disk_include: Vec<String>,
+    /// `net`: interface-name prefixes to leave out (the same list and matching as
+    /// `network.skip_interface_prefixes` for broadcasting: case-sensitive, `lo` matches `lo0`
+    /// but not `local`). Loopback is always left out.
+    pub net_skip_prefixes: Vec<String>,
+}
+
+/// Default `net_skip_prefixes` (same as the config default).
+pub const DEFAULT_NET_SKIP_PREFIXES: &[&str] = &["docker", "br-", "veth", "virbr", "lo"];
+
+impl Default for CollectorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Vec::new(),
+            gpu_backend: GpuBackend::default(),
+            gpu_adapter: String::new(),
+            disk_include: Vec::new(),
+            net_skip_prefixes: DEFAULT_NET_SKIP_PREFIXES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
 }
 
 /// The enabled set, in config order.
@@ -120,7 +142,7 @@ impl Collectors {
                 "gpu" => {
                     GpuCollector::new(cfg.gpu_backend, &cfg.gpu_adapter).map(|c| Box::new(c) as _)
                 }
-                "net" => NetCollector::new().map(|c| Box::new(c) as _),
+                "net" => NetCollector::new(&cfg.net_skip_prefixes).map(|c| Box::new(c) as _),
                 "temp" => TempCollector::new().map(|c| Box::new(c) as _),
                 #[cfg(not(windows))]
                 "load" => LoadCollector::new().map(|c| Box::new(c) as _),
@@ -177,7 +199,7 @@ impl CollectorConfig {
             enabled: ["cpu", "gpu", "mem", "disk"].map(String::from).to_vec(),
             gpu_backend: GpuBackend::Auto,
             gpu_adapter: "auto".into(),
-            disk_include: Vec::new(),
+            ..Self::default()
         }
     }
 }

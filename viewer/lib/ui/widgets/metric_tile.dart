@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../config/display_config.dart';
@@ -324,7 +325,9 @@ class MetricBarRow extends StatelessWidget {
   }
 }
 
-/// One slot as a [LineGraph] panel ("lines" card layout).
+/// One slot as a [LineGraph] panel ("lines" card layout). Ring-derived values (display
+/// value, scale, plotted samples) are computed here, i.e. once per rebuild from the
+/// registry, not per animation frame; [phase] scrolls the plot by repainting only.
 class MetricLineGraph extends StatelessWidget {
   const MetricLineGraph({
     super.key,
@@ -334,6 +337,7 @@ class MetricLineGraph extends StatelessWidget {
     this.smoothingWindowMs = 0,
     this.smoothAnimation = false,
     this.height = 80,
+    this.phase,
   });
 
   final HostState host;
@@ -346,6 +350,9 @@ class MetricLineGraph extends StatelessWidget {
   /// Glide the displayed value at frame rate ([ValueFollower]); false = snap.
   final bool smoothAnimation;
   final double height;
+
+  /// Shared scroll phase of the card (see [ScrollPhase]); null = no scrolling.
+  final ValueListenable<double>? phase;
 
   @override
   Widget build(BuildContext context) {
@@ -365,29 +372,28 @@ class MetricLineGraph extends StatelessWidget {
     }
     final c = RtmColors.of(context);
     final ring = host.history[slot.key];
+    final values = ring?.values.toList(growable: false) ?? const <double?>[];
     final peak = peakFor(host, slot.key, peakHoldSeconds);
+    final target = displayValue(host, slot.key, m.v, smoothingWindowMs);
+    final range = resolveMax(m, ring) - m.min;
     // Value text glides; the plot scrolls by the time since the last packet.
-    return ScrollPhase(
-      sampleKey: host.latest.seq,
-      interval: host.interval,
+    return ValueFollower(
+      target: target,
+      tau: followerTau(host.interval),
+      range: range,
       enabled: smoothAnimation,
-      builder: (context, phase) => ValueFollower(
-        target: displayValue(host, slot.key, m.v, smoothingWindowMs),
-        tau: followerTau(host.interval),
-        range: resolveMax(m, ring) - m.min,
-        enabled: smoothAnimation,
-        builder: (context, v) => LineGraph(
-          ring: ring,
-          value: v,
-          unit: m.unit,
-          label: m.label,
-          min: m.min,
-          max: m.max,
-          peak: peak,
-          color: c.forValue(v, min: m.min, max: m.max),
-          height: height,
-          phase: phase,
-        ),
+      builder: (context, v) => LineGraph(
+        ring: ring,
+        values: values,
+        value: v,
+        unit: m.unit,
+        label: m.label,
+        min: m.min,
+        max: m.max,
+        peak: peak,
+        color: c.forValue(v, min: m.min, max: m.max),
+        height: height,
+        phase: smoothAnimation ? phase : null,
       ),
     );
   }

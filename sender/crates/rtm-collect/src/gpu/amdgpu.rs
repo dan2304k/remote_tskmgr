@@ -1,12 +1,21 @@
 //! amdgpu sysfs backend (Linux): `device/gpu_busy_percent`, `mem_info_vram_{used,total}`,
 //! hwmon `temp1_input` (edge), and the active `pp_dpm_sclk` level for frequency.
+//!
+//! Only the chosen card is read every tick. Reading these files resumes a runtime-suspended
+//! dGPU, so the other cards' `detail.adapters` values are refreshed only every
+//! [`OTHERS_EVERY`] (a sleeping card then wakes briefly every 10 s instead of every tick).
 
 use super::adapters::{adapters_detail, from_sysfs, Adapter};
 use super::sysfs::{self, hwmon_temp_path, read_str, read_u64};
 use super::{Ctx, GpuSource};
 use crate::util::{mib, num, MIB};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How often the cards that are not reported are read for `detail.adapters`.
+pub const OTHERS_EVERY: Duration = Duration::from_secs(10);
 
 pub struct AmdGpu {
     root: PathBuf,
@@ -15,6 +24,9 @@ pub struct AmdGpu {
     temp: Option<PathBuf>,
     /// Every GPU detected, for `detail.adapters`.
     list: Vec<Adapter>,
+    /// `detail.adapters` extras of the other cards (by id) and when they were read.
+    others: HashMap<String, Map<String, Value>>,
+    others_at: Option<Instant>,
 }
 
 impl AmdGpu {
@@ -48,6 +60,8 @@ impl AmdGpu {
             temp: hwmon_temp_path(&card),
             adapter: chosen,
             list,
+            others: HashMap::new(),
+            others_at: None,
         })
     }
 }
@@ -66,15 +80,35 @@ impl GpuSource for AmdGpu {
     }
 
     fn read(&mut self) -> (Option<f64>, Map<String, Value>) {
+        self.read_at(Instant::now())
+    }
+}
+
+/// `detail.adapters` extras of one card: `card`, `busy`, `vram_used_mb`.
+fn card_extra(root: &Path, a: &Adapter) -> Map<String, Value> {
+    let dev = root.join(&a.id).join("device");
+    let mut m = Map::new();
+    m.insert("card".into(), Value::from(a.id.clone()));
+    if a.vendor == Some(sysfs::VENDOR_AMD) {
+        if let Some(b) = read_u64(&dev.join("gpu_busy_percent")) {
+            m.insert("busy".into(), Value::from(b.min(100)));
+        }
+        if let Some(u) = read_u64(&dev.join("mem_info_vram_used")) {
+            m.insert("vram_used_mb".into(), mib(u));
+        }
+    }
+    m
+}
+
+impl AmdGpu {
+    fn read_at(&mut self, now: Instant) -> (Option<f64>, Map<String, Value>) {
         let busy = read_u64(&self.dev.join("gpu_busy_percent")).map(|v| v.min(100) as f64);
         let mut d = Map::new();
         d.insert("name".into(), Value::from(self.adapter.name.clone()));
         d.insert("adapter_index".into(), Value::from(self.adapter.index));
         d.insert("card".into(), Value::from(self.adapter.id.clone()));
-        if let (Some(used), Some(total)) = (
-            read_u64(&self.dev.join("mem_info_vram_used")),
-            read_u64(&self.dev.join("mem_info_vram_total")),
-        ) {
+        let used = read_u64(&self.dev.join("mem_info_vram_used"));
+        if let (Some(used), Some(total)) = (used, read_u64(&self.dev.join("mem_info_vram_total"))) {
             if total >= MIB {
                 d.insert("vram_used_mb".into(), mib(used));
                 d.insert("vram_total_mb".into(), mib(total));
@@ -86,15 +120,31 @@ impl GpuSource for AmdGpu {
         if let Some(f) = read_str(&self.dev.join("pp_dpm_sclk")).and_then(|s| active_sclk_mhz(&s)) {
             d.insert("freq_mhz".into(), Value::from(f));
         }
-        let root = &self.root;
+        if self
+            .others_at
+            .is_none_or(|t| now.saturating_duration_since(t) >= OTHERS_EVERY)
+        {
+            self.others_at = Some(now);
+            self.others = self
+                .list
+                .iter()
+                .filter(|a| a.id != self.adapter.id)
+                .map(|a| (a.id.clone(), card_extra(&self.root, a)))
+                .collect();
+        }
+        let me = &self.adapter.id;
+        let others = &self.others;
         let adapters = adapters_detail(&self.list, Some(self.adapter.index), |a| {
-            let dev = root.join(&a.id).join("device");
+            if a.id != *me {
+                return others.get(&a.id).cloned().unwrap_or_default();
+            }
+            // The chosen card: this tick's values, no extra reads.
             let mut m = Map::new();
             m.insert("card".into(), Value::from(a.id.clone()));
-            if let Some(b) = read_u64(&dev.join("gpu_busy_percent")) {
-                m.insert("busy".into(), Value::from(b.min(100)));
+            if let Some(b) = busy {
+                m.insert("busy".into(), Value::from(b as u64));
             }
-            if let Some(u) = read_u64(&dev.join("mem_info_vram_used")) {
+            if let Some(u) = used {
                 m.insert("vram_used_mb".into(), mib(u));
             }
             m
@@ -176,6 +226,20 @@ mod tests {
         // Busy value out of range is capped.
         w(r, "card2/device/gpu_busy_percent", "250\n");
         assert_eq!(g.read().0, Some(100.0));
+        // Other cards are re-read only every OTHERS_EVERY (no waking a sleeping dGPU).
+        w(r, "card1/device/gpu_busy_percent", "55\n");
+        let t0 = Instant::now();
+        let mut g = AmdGpu::probe(r, &Ctx::default()).unwrap();
+        let (_, d) = g.read_at(t0);
+        assert_eq!(d["adapters"]["#1"]["busy"], 55);
+        w(r, "card1/device/gpu_busy_percent", "66\n");
+        w(r, "card2/device/gpu_busy_percent", "43\n");
+        let (v, d) = g.read_at(t0 + Duration::from_secs(5));
+        assert_eq!(v, Some(43.0), "the chosen card is read every tick");
+        assert_eq!(d["adapters"]["#2"]["busy"], 43);
+        assert_eq!(d["adapters"]["#1"]["busy"], 55, "cached");
+        let (_, d) = g.read_at(t0 + OTHERS_EVERY);
+        assert_eq!(d["adapters"]["#1"]["busy"], 66);
         // File vanishing (GPU reset) gives null, not a panic.
         fs::remove_file(r.join("card2/device/gpu_busy_percent")).unwrap();
         assert_eq!(g.read().0, None);
@@ -201,6 +265,7 @@ mod tests {
             target,
             pinned,
             strict: true,
+            ..Ctx::default()
         };
         let (v, d) = AmdGpu::probe(t.path(), &ctx).unwrap().read();
         assert_eq!(v, Some(97.0));
@@ -217,6 +282,7 @@ mod tests {
             target,
             pinned,
             strict: true,
+            ..Ctx::default()
         };
         let (v, d) = AmdGpu::probe(t.path(), &ctx).unwrap().read();
         assert_eq!(v, Some(12.0));

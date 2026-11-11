@@ -49,6 +49,19 @@ pub fn bottom_right(work: egui::Rect, size: egui::Vec2) -> egui::Pos2 {
     p.max(work.min)
 }
 
+/// The next tray event as an outcome. Once the splash is closing (timed out, clicked, or an
+/// earlier event) nothing more is taken, so a later Quit / Settings… stays queued for the
+/// main loop instead of being lost in the splash's last frames.
+fn next_event(events: &Receiver<GuiEvent>, closing: bool) -> Option<Outcome> {
+    if closing {
+        return None;
+    }
+    Some(match events.try_recv().ok()? {
+        GuiEvent::OpenSettings => Outcome::OpenSettings,
+        GuiEvent::Quit | GuiEvent::DaemonExited => Outcome::Quit,
+    })
+}
+
 /// Show the splash and block until it closes. Tries a frameless always-on-top window first,
 /// then a normal small window with a title if the platform refuses that.
 pub fn show(events: &Receiver<GuiEvent>) -> anyhow::Result<Outcome> {
@@ -172,11 +185,8 @@ fn work_area(ctx: &egui::Context) -> Option<egui::Rect> {
 
 impl eframe::App for Splash {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        while let Ok(ev) = self.events.try_recv() {
-            match ev {
-                GuiEvent::OpenSettings => self.close(ctx, Outcome::OpenSettings),
-                GuiEvent::Quit | GuiEvent::DaemonExited => self.close(ctx, Outcome::Quit),
-            }
+        if let Some(outcome) = next_event(&self.events, self.closing) {
+            self.close(ctx, outcome);
         }
         if self.start.elapsed() >= DURATION {
             self.close(ctx, Outcome::Done);
@@ -243,6 +253,20 @@ impl eframe::App for Splash {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn events_after_closing_stay_queued() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        assert_eq!(next_event(&rx, false), None);
+        tx.send(GuiEvent::OpenSettings).unwrap();
+        tx.send(GuiEvent::Quit).unwrap();
+        assert_eq!(next_event(&rx, false), Some(Outcome::OpenSettings));
+        // Now closing: the Quit is left for the main loop.
+        assert_eq!(next_event(&rx, true), None);
+        assert_eq!(rx.try_recv(), Ok(GuiEvent::Quit));
+        tx.send(GuiEvent::DaemonExited).unwrap();
+        assert_eq!(next_event(&rx, false), Some(Outcome::Quit));
+    }
 
     #[test]
     fn bar_shrinks_to_zero() {

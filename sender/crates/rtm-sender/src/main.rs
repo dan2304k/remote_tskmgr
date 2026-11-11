@@ -8,35 +8,55 @@ mod app;
 mod cli;
 #[cfg(feature = "gui")]
 mod gui;
+mod instance;
+mod logging;
 mod reload;
 mod status;
 
 use anyhow::Context;
 use clap::Parser;
 use rtm_config::Config;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tracing_subscriber::EnvFilter;
 
 fn main() -> ExitCode {
     #[cfg(all(windows, feature = "gui"))]
     gui::console::attach_if_printing();
-    let cli = cli::Cli::parse();
-    let filter =
-        EnvFilter::try_from_env("RTM_LOG").unwrap_or_else(|_| EnvFilter::new(cli.log_level()));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        // No colour codes in the systemd journal / redirected logs.
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .init();
-    match real_main(&cli) {
+    let cli = match cli::Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            // Windows GUI build: make usage errors visible (parent console or a message box).
+            #[cfg(all(windows, feature = "gui"))]
+            gui::console::report_usage_error(&e);
+            e.exit();
+        }
+    };
+    let path = cli.config_path();
+    let log_file = log_file(&cli, &path);
+    logging::init(cli.log_level(), log_file.as_deref());
+    match real_main(&cli, &path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e:#}");
-            ExitCode::FAILURE
+            #[cfg(all(windows, feature = "gui"))]
+            if let Some(log) = &log_file {
+                gui::console::report_fatal(&e, log);
+            }
+            if e.downcast_ref::<instance::AlreadyRunning>().is_some() {
+                ExitCode::from(instance::EXIT_ALREADY_RUNNING)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
+}
+
+/// GUI mode (the `gui` build, except the one-shot `--once` / `--print-config`) also logs to
+/// `sender.log` next to the config.
+fn log_file(cli: &cli::Cli, config: &Path) -> Option<PathBuf> {
+    let gui_mode = cfg!(feature = "gui") && !cli.once && !cli.print_config;
+    gui_mode.then(|| logging::log_path(config))
 }
 
 /// File config + CLI overrides, validated.
@@ -46,8 +66,14 @@ fn effective_config(cli: &cli::Cli, mut cfg: Config) -> anyhow::Result<Config> {
     Ok(cfg)
 }
 
-fn real_main(cli: &cli::Cli) -> anyhow::Result<()> {
-    let path = cli.config_path();
+fn real_main(cli: &cli::Cli, path: &Path) -> anyhow::Result<()> {
+    let path = path.to_path_buf();
+    // Taken before the config is loaded (loading may write it). Not for the one-shot modes.
+    let _instance = if cli.once || cli.print_config {
+        None
+    } else {
+        Some(instance::acquire(&path)?)
+    };
     let file_cfg = Config::load_or_create(&path)
         .with_context(|| format!("loading config {}", path.display()))?;
 

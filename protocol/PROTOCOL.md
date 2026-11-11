@@ -110,6 +110,10 @@ detection on a LAN, not encryption.
 * strings escaped minimally (only `"`, `\`, and control characters; non-ASCII emitted as UTF-8,
   not `\uXXXX`). Python: `ensure_ascii=False`.
 
+Numbers that must not appear in an authenticated packet (no verifier can reproduce their
+bytes, so a viewer with a secret set rejects the packet): the integer token `-0`, integers
+outside the signed 64-bit range (≥ 2^63 or < −2^63), and non-finite values (rejected always).
+
 `examples/valid_with_auth.json` is signed with the secret `correct horse` over the whole file
 (its `_comment` included); both implementations must verify it.
 

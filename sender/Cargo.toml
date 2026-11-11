@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/dan2304k/remote_tskmgr"
@@ -36,6 +36,7 @@ hex = "0.4"
 parking_lot = "0.12"
 hostname = "0.4"
 ctrlc = { version = "3", features = ["termination"] }
+socket2 = "0.6"
 
 [profile.release]
 opt-level = "z"

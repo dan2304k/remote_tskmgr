@@ -185,6 +185,130 @@ void main() {
     });
   });
 
+  group('TcpListener hardening', () {
+    /// Completes when the peer closes [sock].
+    Future<void> closedByPeer(Socket sock) {
+      final done = Completer<void>();
+      sock.listen(
+        (_) {},
+        onDone: () => done.isCompleted ? null : done.complete(),
+        onError: (_) => done.isCompleted ? null : done.complete(),
+      );
+      return done.future.timeout(const Duration(seconds: 10));
+    }
+
+    Future<TcpListener> listener({
+      int maxLineBytes = kTcpMaxLineBytes,
+      Duration minIdle = kTcpMinIdleTimeout,
+      int maxConnections = kTcpMaxConnections,
+    }) async {
+      final tcp = TcpListener(
+        intake: intake,
+        port: 0,
+        address: loopback,
+        maxLineBytes: maxLineBytes,
+        minIdleTimeout: minIdle,
+        maxConnections: maxConnections,
+      );
+      await tcp.start();
+      addTearDown(tcp.stop);
+      return tcp;
+    }
+
+    test('defaults: 64 KB lines, 15 s idle floor, 32 connections', () {
+      expect(kTcpMaxLineBytes, 65536);
+      expect(kTcpMinIdleTimeout, const Duration(seconds: 15));
+      expect(kTcpMaxConnections, 32);
+    });
+
+    test('idle timeout is max(floor, 5 x interval)', () {
+      const floor = Duration(seconds: 15);
+      expect(tcpIdleTimeout(floor, null), floor);
+      expect(tcpIdleTimeout(floor, 1000), floor);
+      expect(tcpIdleTimeout(floor, 10000), const Duration(seconds: 50));
+      expect(tcpIdleTimeout(floor, 0), floor);
+    });
+
+    test('a line over the cap drops the connection', () async {
+      final tcp = await listener(maxLineBytes: 1024);
+      final sock = await Socket.connect(loopback, tcp.boundPort!);
+      final closed = closedByPeer(sock);
+      // A full packet under the cap is fine.
+      final ok = line('valid_minimal.json');
+      expect(ok.length, lessThan(1024));
+      sock.write('$ok\n');
+      await sock.flush();
+      await eventually(() => registry.hosts.containsKey('min'));
+      // Then 2 KB without a newline.
+      sock.add(List.filled(2048, 0x20));
+      await sock.flush();
+      await closed;
+      await eventually(() => tcp.connections == 0);
+      expect(intake.lastError, contains('longer than 1024'));
+    });
+
+    test('the cap counts bytes buffered across writes', () async {
+      final tcp = await listener(maxLineBytes: 1024);
+      final sock = await Socket.connect(loopback, tcp.boundPort!);
+      final closed = closedByPeer(sock);
+      for (var i = 0; i < 5; i++) {
+        sock.add(List.filled(300, 0x20));
+        await sock.flush();
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      await closed;
+      await eventually(() => tcp.connections == 0);
+    });
+
+    test('a connection without a complete line is closed when idle', () async {
+      final tcp = await listener(minIdle: const Duration(milliseconds: 200));
+      final sock = await Socket.connect(loopback, tcp.boundPort!);
+      final closed = closedByPeer(sock);
+      sock.write('{"partial":');
+      await sock.flush();
+      await closed;
+      await eventually(() => tcp.connections == 0);
+      expect(intake.lastError, contains('no complete line'));
+    });
+
+    test('lines keep a connection open past the idle floor', () async {
+      final tcp = await listener(minIdle: const Duration(milliseconds: 1500));
+      final sock = await Socket.connect(loopback, tcp.boundPort!);
+      var closedEarly = false;
+      sock.listen((_) {}, onDone: () => closedEarly = true);
+      for (var i = 0; i < 8; i++) {
+        sock.write('\n'); // blank keep-alive lines count as complete lines
+        await sock.flush();
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+      }
+      expect(closedEarly, isFalse);
+      expect(tcp.connections, 1);
+      sock.destroy();
+    });
+
+    test('connections beyond the cap are refused', () async {
+      final tcp = await listener(maxConnections: 2);
+      final a = await Socket.connect(loopback, tcp.boundPort!);
+      final b = await Socket.connect(loopback, tcp.boundPort!);
+      await eventually(() => tcp.connections == 2);
+      final c = await Socket.connect(loopback, tcp.boundPort!);
+      await closedByPeer(c);
+      expect(tcp.connections, 2);
+      expect(tcp.rejectedConnections, 1);
+      // The open ones still work.
+      a.write('${line('valid_minimal.json')}\n');
+      await a.flush();
+      await eventually(() => registry.hosts.containsKey('min'));
+      a.destroy();
+      await eventually(() => tcp.connections == 1);
+      // A slot is free again.
+      final d = await Socket.connect(loopback, tcp.boundPort!);
+      await eventually(() => tcp.connections == 2);
+      b.destroy();
+      d.destroy();
+    });
+  });
+
   group('NetController', () {
     late DisplayConfig config;
     late NetController net;
@@ -218,6 +342,23 @@ void main() {
       ]);
       await net.stop();
       expect(net.running, isFalse);
+    });
+
+    test('8 new metric keys in one packet: one notify, one save', () async {
+      await net.start();
+      final saves = config.saveCount;
+      var notified = 0;
+      config.addListener(() => notified++);
+      final j = fixtureJson('valid_minimal.json');
+      j['metrics'] = {
+        for (var i = 0; i < 8; i++)
+          'k$i': {'v': i, 'unit': 'x', 'label': 'K$i'},
+      };
+      await sendUdp(config.udpPort, jsonEncode(j));
+      await eventually(() => registry.hosts.isNotEmpty);
+      expect(config.slots.where((s) => s.key.startsWith('k')), hasLength(8));
+      expect(notified, 1);
+      expect(config.saveCount - saves, 1);
     });
 
     test(

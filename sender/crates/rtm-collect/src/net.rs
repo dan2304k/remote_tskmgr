@@ -1,6 +1,7 @@
 //! `net`: received + transmitted MB/s over physical-ish interfaces.
 //!
-//! Loopback and virtual bridges (`docker*`, `br-*`, `veth*`, `virbr*`) are skipped, otherwise
+//! Loopback and the configured prefixes (default `docker*`, `br-*`, `veth*`, `virbr*`, `lo*`,
+//! matched like `rtm_net`'s broadcast selection, see `skip_interface`) are skipped, otherwise
 //! container traffic would be counted twice. Counters are differenced against our own
 //! baseline: a newly appearing interface contributes 0 on its first tick.
 
@@ -11,15 +12,26 @@ use std::collections::HashMap;
 use std::time::Duration;
 use sysinfo::Networks;
 
-const SKIP_PREFIXES: &[&str] = &["lo", "docker", "br-", "veth", "virbr"];
-
-pub(crate) fn skip_interface(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    SKIP_PREFIXES.iter().any(|p| n.starts_with(p)) || n.contains("loopback")
+/// Loopback (always; sysinfo has no loopback flag, so by name) or a name matched by one of
+/// `prefixes`, with the same rule as `rtm_net::iface::skipped_by_prefix`: case-sensitive, and
+/// the name must equal the prefix or continue with something other than an ASCII lowercase
+/// letter (`lo` matches `lo0`, not "Local Area Connection").
+pub(crate) fn skip_interface(name: &str, prefixes: &[String]) -> bool {
+    name == "lo" || name.to_ascii_lowercase().contains("loopback") || {
+        prefixes.iter().map(|p| p.trim()).any(|p| {
+            !p.is_empty()
+                && name.starts_with(p)
+                && !name[p.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase())
+        })
+    }
 }
 
 pub struct NetCollector {
     nets: Networks,
+    skip: Vec<String>,
     prev: HashMap<String, (u64, u64)>,
     clock: Stopwatch,
     /// Last reading, repeated for ticks closer than `MIN_WINDOW` to it.
@@ -27,10 +39,11 @@ pub struct NetCollector {
 }
 
 impl NetCollector {
-    pub fn new() -> Option<Self> {
+    pub fn new(skip_prefixes: &[String]) -> Option<Self> {
         let nets = Networks::new_with_refreshed_list().ok()?;
         let mut me = Self {
             nets,
+            skip: skip_prefixes.to_vec(),
             prev: HashMap::new(),
             clock: Stopwatch::new(),
             hold: Hold::new(),
@@ -44,7 +57,7 @@ impl NetCollector {
             .iter()
             .filter_map(|(name, data)| {
                 let name = name.to_string_lossy();
-                (!skip_interface(&name)).then(|| {
+                (!skip_interface(&name, &self.skip)).then(|| {
                     (
                         name.into_owned(),
                         (data.total_received(), data.total_transmitted()),
@@ -95,6 +108,10 @@ mod tests {
 
     #[test]
     fn interface_filter() {
+        let skip: Vec<String> = crate::DEFAULT_NET_SKIP_PREFIXES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         for n in [
             "lo",
             "docker0",
@@ -103,10 +120,28 @@ mod tests {
             "virbr0",
             "Loopback Pseudo-Interface 1",
         ] {
-            assert!(skip_interface(n), "{n}");
+            assert!(skip_interface(n, &skip), "{n}");
         }
         for n in ["enp0s31f6", "wlan0", "eth0", "Ethernet"] {
-            assert!(!skip_interface(n), "{n}");
+            assert!(!skip_interface(n, &skip), "{n}");
         }
+        for n in ["lo0", "br-1ee4"] {
+            assert!(skip_interface(n, &skip), "{n}");
+        }
+        for n in [
+            "Local Area Connection",
+            "local0",
+            "vEthernet (External)",
+            "Docker1",
+        ] {
+            assert!(!skip_interface(n, &skip), "{n}");
+        }
+        // Configured prefixes are case-sensitive; loopback is skipped even with an empty list.
+        let custom = vec!["wlan".to_string(), "".to_string()];
+        assert!(skip_interface("wlan0", &custom));
+        assert!(!skip_interface("WLAN0", &custom));
+        assert!(!skip_interface("docker0", &custom));
+        assert!(skip_interface("lo", &[]));
+        assert!(skip_interface("Loopback Pseudo-Interface 1", &[]));
     }
 }

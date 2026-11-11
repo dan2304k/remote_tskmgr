@@ -1,7 +1,8 @@
 //! `disk`: read + write throughput in MB/s summed over physical disks.
 //!
 //! sysinfo lists mounted filesystems. We drop pseudo / virtual filesystems, dedupe by device
-//! name (bind mounts and btrfs subvolumes show the same device several times), and difference
+//! name (bind mounts and btrfs subvolumes show the same device several times; on Windows,
+//! where the "name" is the volume label, by mount point instead), and difference
 //! the cumulative `total_read_bytes` / `total_written_bytes` counters ourselves. A device seen
 //! for the first time contributes 0 on that tick, so the first sample after construction (and
 //! after a disk is hot-plugged) is 0, never a spike; deltas use `saturating_sub` so a counter
@@ -57,13 +58,22 @@ fn refresh_kind() -> DiskRefreshKind {
 }
 
 /// Display / dedupe key for a disk: device name without `/dev/`, or the mount point when the
-/// platform gives no name (Windows volumes without a label).
+/// platform gives no name. On Windows always the mount point (`C:`): sysinfo's name there is
+/// the volume label, and two volumes labelled e.g. "Data" must not collapse into one.
 pub(crate) fn disk_key(name: &str, mount: &str) -> String {
+    disk_key_for(name, mount, cfg!(windows))
+}
+
+pub(crate) fn disk_key_for(name: &str, mount: &str, by_mount: bool) -> String {
+    let m = mount.trim().trim_end_matches(['\\', '/']);
+    if by_mount && !m.is_empty() {
+        return m.to_string();
+    }
     let n = name.trim();
     let n = n.strip_prefix("/dev/").unwrap_or(n);
     let n = n.strip_prefix("mapper/").unwrap_or(n);
     if n.is_empty() {
-        mount.trim_end_matches(['\\', '/']).to_string()
+        m.to_string()
     } else {
         n.to_string()
     }
@@ -191,9 +201,15 @@ mod tests {
 
     #[test]
     fn keys_and_filters() {
+        #[cfg(not(windows))]
         assert_eq!(disk_key("/dev/nvme0n1p2", "/boot"), "nvme0n1p2");
-        assert_eq!(disk_key("", "C:\\"), "C:");
-        assert_eq!(disk_key("/dev/mapper/vg-root", "/"), "vg-root");
+        assert_eq!(disk_key_for("/dev/mapper/vg-root", "/", false), "vg-root");
+        assert_eq!(disk_key_for("", "C:\\", false), "C:");
+        // Windows: two volumes with the same label stay apart; label-less ones too.
+        assert_eq!(disk_key_for("Data", "D:\\", true), "D:");
+        assert_eq!(disk_key_for("Data", "E:\\", true), "E:");
+        assert_eq!(disk_key_for("", "C:\\", true), "C:");
+        assert_eq!(disk_key_for("Data", "", true), "Data");
         assert!(is_pseudo("tmpfs", "tmpfs"));
         assert!(is_pseudo("squashfs", "/dev/loop3"));
         assert!(!is_pseudo("ext4", "/dev/sda1"));

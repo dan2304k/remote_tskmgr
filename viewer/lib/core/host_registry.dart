@@ -29,6 +29,18 @@ const Duration kMetricWindow = Duration(seconds: 10);
 /// Averaging window for [HostRegistry.packetRate].
 const Duration kRateWindow = Duration(seconds: 5);
 
+/// A seq below the previous one is a sender restart (accepted at once) when it is below
+/// this, or when it is more than [kSeqRestartGap] below the previous seq.
+const int kSeqRestartBelow = 10;
+const int kSeqRestartGap = 1000;
+
+/// History and metricLastSeen keys a host has not reported for this many
+/// [HostState.metricWindow]s are pruned.
+const int kMetricPruneWindows = 10;
+
+/// Hosts offline for longer than this are removed automatically.
+const Duration kAutoRemoveOfflineAfter = Duration(hours: 24);
+
 /// Fixed-capacity ring of recent samples for sparklines. Oldest first in [values].
 class RingBuffer {
   RingBuffer(this.capacity);
@@ -58,6 +70,17 @@ class RingBuffer {
 class HostState {
   HostState({required this.id, required this.latest, required this.lastSeen});
   final String id;
+
+  final _HostNotifier _changes = _HostNotifier();
+
+  /// Notifies when this host's data changes: every accepted packet, its status, or its
+  /// recently reported metric set. Widgets that show one host listen here rather than
+  /// to the whole [HostRegistry], so a packet for host A does not rebuild host B.
+  Listenable get changes => _changes;
+
+  /// Notifies [changes] listeners. The registry calls this; tests that mutate a host
+  /// directly may too.
+  void notifyChanged() => _changes.notify();
   Packet latest;
   DateTime lastSeen;
   HostStatus status = HostStatus.live;
@@ -117,6 +140,21 @@ class HostState {
     return six > kOfflineAfter ? six : kOfflineAfter;
   }
 
+  /// Drops [history] / [metricLastSeen] entries for keys not reported for
+  /// [kMetricPruneWindows] x [metricWindow], measured from [lastSeen] (so a silent
+  /// host keeps its last layout).
+  void _pruneMetrics() {
+    final cutoff = lastSeen.subtract(metricWindow * kMetricPruneWindows);
+    final gone = [
+      for (final e in metricLastSeen.entries)
+        if (e.value.isBefore(cutoff)) e.key,
+    ];
+    for (final k in gone) {
+      metricLastSeen.remove(k);
+      history.remove(k);
+    }
+  }
+
   /// Status implied by the clock alone.
   HostStatus statusAt(DateTime now) {
     final age = now.difference(lastSeen);
@@ -126,8 +164,13 @@ class HostState {
   }
 }
 
-/// All hosts heard so far, keyed by packet id. Notifies on every accepted packet and on
-/// status transitions (a timer re-evaluates staleness every second).
+class _HostNotifier extends ChangeNotifier {
+  void notify() => notifyListeners();
+}
+
+/// All hosts heard so far, keyed by packet id. Notifies when the host set changes, a
+/// host is renamed, or a status changes (a timer re-evaluates staleness every second).
+/// Per-packet updates go to each host's [HostState.changes] instead.
 class HostRegistry extends ChangeNotifier {
   HostRegistry({DateTime Function()? now}) : _now = now ?? DateTime.now;
 
@@ -155,30 +198,36 @@ class HostRegistry extends ChangeNotifier {
     return list;
   }
 
-  /// Union of metric keys over all hosts, in first-seen order.
-  Set<String> get knownMetricKeys {
-    final keys = <String>{};
-    for (final h in hosts.values) {
-      keys.addAll(h.history.keys);
-    }
-    return keys;
-  }
+  /// Whether [seq] after [prev] looks like a restarted sender (seq reset) rather than a
+  /// reordered datagram: it went backwards to near zero, or by more than
+  /// [kSeqRestartGap].
+  static bool isSeqRestart(int seq, int prev) =>
+      seq < prev && (seq < kSeqRestartBelow || prev - seq > kSeqRestartGap);
 
   /// Accepts [p] unless it is a duplicate or reordered packet from a known host. Returns
   /// whether it was accepted.
+  ///
+  /// Notifies the host's own [HostState.changes] on every accepted packet; the registry
+  /// itself notifies only when the host set, a host's name or its status changes (what
+  /// the dashboard order depends on).
   bool ingest(Packet p, {String? source}) {
     final now = _now();
     final existing = hosts[p.id];
     final HostState state;
+    var structural = false;
     if (existing == null) {
       state = HostState(id: p.id, latest: p, lastSeen: now);
       hosts[p.id] = state;
+      structural = true;
     } else {
       final prev = existing.latest;
       final sameRun = (p.ts - prev.ts).abs() <= kReorderWindow.inMilliseconds;
-      if (p.seq <= prev.seq && sameRun) {
+      if (p.seq <= prev.seq && sameRun && !isSeqRestart(p.seq, prev.seq)) {
         droppedOutOfOrder++;
         return false;
+      }
+      if (existing.status != HostStatus.live || prev.host != p.host) {
+        structural = true;
       }
       state = existing
         ..latest = p
@@ -194,7 +243,8 @@ class HostRegistry extends ChangeNotifier {
     _firstAccepted ??= now;
     _recent.addLast(now);
     _pruneRecent(now);
-    notifyListeners();
+    state.notifyChanged();
+    if (structural) notifyListeners();
     return true;
   }
 
@@ -202,30 +252,36 @@ class HostRegistry extends ChangeNotifier {
     if (hosts.remove(id) != null) notifyListeners();
   }
 
-  /// Removes every offline host. Returns how many were removed.
-  int removeOffline() {
-    final before = hosts.length;
-    hosts.removeWhere((_, h) => h.status == HostStatus.offline);
-    final n = before - hosts.length;
-    if (n > 0) notifyListeners();
-    return n;
-  }
-
-  /// Re-evaluate statuses and recently reported metrics from the clock. Called by a
-  /// periodic timer in NetController.
+  /// Re-evaluate statuses and recently reported metrics from the clock, prune metric
+  /// keys a host stopped sending long ago, and drop hosts offline for longer than
+  /// [kAutoRemoveOfflineAfter]. Called by a periodic timer in NetController.
   void tick(DateTime now) {
     var changed = false;
+    final expired = <String>[];
     for (final h in hosts.values) {
+      if (now.difference(h.lastSeen) >
+          h.offlineAfter + kAutoRemoveOfflineAfter) {
+        expired.add(h.id);
+        continue;
+      }
+      var hostChanged = false;
       final s = h.statusAt(now);
       if (s != h.status) {
         h.status = s;
         changed = true;
+        hostChanged = true;
       }
+      h._pruneMetrics();
       final recent = h.recentMetricKeys(now);
       if (!setEquals(recent, h._recentAtTick)) {
         h._recentAtTick = recent;
-        changed = true;
+        hostChanged = true;
       }
+      if (hostChanged) h.notifyChanged();
+    }
+    for (final id in expired) {
+      hosts.remove(id);
+      changed = true;
     }
     _pruneRecent(now);
     if (changed) notifyListeners();

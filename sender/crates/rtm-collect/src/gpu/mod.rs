@@ -64,6 +64,9 @@ pub(crate) struct Ctx {
     pub target: Option<adapters::Adapter>,
     #[cfg_attr(not(windows), allow(dead_code))]
     pub pinned: bool,
+    /// `metrics.gpu_adapter` as configured (PDH re-resolves it after a driver reset).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub pin: String,
     /// Auto: a backend that cannot serve `target` declines, so the next one gets it.
     /// Explicit backend: it serves its own default instead.
     pub strict: bool,
@@ -113,6 +116,7 @@ impl GpuCollector {
             list,
             target,
             pinned,
+            pin: adapter.to_string(),
             strict: verify,
         };
         let cands: Vec<Probe> = match backend {
@@ -312,7 +316,7 @@ fn try_pdh(ctx: &Ctx) -> Option<Box<dyn GpuSource>> {
         // PDH sees every adapter, so it can always serve the target.
         // A registry-fallback target has no LUID, so PDH cannot match it: use the heuristics.
         let target = ctx.target.clone().filter(|t| t.id.starts_with("0x"));
-        match pdh::PdhSource::new(ctx.list.clone(), target, ctx.pinned) {
+        match pdh::PdhSource::new(ctx.list.clone(), target, ctx.pinned, ctx.pin.clone()) {
             Ok(s) => return Some(Box::new(s)),
             Err(e) => tracing::debug!("gpu: pdh unavailable: {e}"),
         }
@@ -562,6 +566,7 @@ mod tests {
             target,
             pinned,
             strict: true,
+            ..Ctx::default()
         };
         assert!(
             !ctx.declines(adapters::Adapter::is_nvidia),

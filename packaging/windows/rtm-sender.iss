@@ -2,8 +2,9 @@
 ; Compile on Windows with Inno Setup (https://jrsoftware.org/isinfo.php):
 ;   iscc /DAppVersion=1.2.3 packaging\windows\rtm-sender.iss
 ; after sender\build.bat has produced dist\windows-x86_64\rtm-sender.exe. Without
-; /DAppVersion the version is read from [workspace.package] in sender\Cargo.toml (the exe
-; has no version resource, so GetVersionNumbersString cannot be used).
+; /DAppVersion the version is read from [workspace.package] in sender\Cargo.toml. (The exe
+; also carries it in its version resource since 1.0.1; the release workflow passes
+; /DAppVersion from the git tag.)
 
 #define AppName "rtm-sender"
 

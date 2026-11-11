@@ -10,6 +10,11 @@ Each GitHub release has these sender assets:
 | `rtm-sender-gui-linux-x86_64` | Linux desktops: tray icon + settings window. Needs GTK 3 and libayatana-appindicator3 installed; without them it does not start at all, not even with `--no-gui`. |
 | `rtm-sender-windows-x86_64.zip` | Windows: `rtm-sender.exe` (tray + settings), `install.bat`, `uninstall.bat`, `LICENSE`, this file as `INSTALL.md`. |
 | `rtm-sender-windows-x86_64.exe` | Windows: the same exe alone, to run in place. |
+| `rtm-sender-setup.exe` | Windows: Inno Setup installer for the same exe (see below). |
+| `SHA256SUMS` | SHA-256 of every asset above and `rtm-viewer.apk`. Check with `sha256sum -c SHA256SUMS --ignore-missing` (PowerShell: `Get-FileHash <file>`). |
+
+The Windows exe carries a version resource (Explorer → Properties → Details) and the tray icon
+as its file icon.
 
 Or build it yourself: `sender/build.sh` / `sender\build.bat` (tray build into `dist/<os>-<arch>/`,
 add `headless` for the no-GUI build), or `cd sender && cargo build --release -p rtm-sender`
@@ -32,6 +37,21 @@ secret, metrics). Check a config without sending anything:
 rtm-sender --print-config     # effective config (file + flags)
 rtm-sender --once             # one JSON packet on stdout
 ```
+
+Only one sender runs per config file. It holds a lock on `sender.toml.lock` next to the config;
+a second copy started with the same config exits with exit code 3 and "already running" (on
+stderr, in the log, and on Windows in a message box). `--once` and `--print-config` do not take
+the lock. A sender with a different `--config` is independent.
+
+## Log file
+
+The tray build (except `--once` / `--print-config`) writes its log to `sender.log` in the same
+folder as `sender.toml` (`~/.config/rtm/sender.log`, `%APPDATA%\rtm\sender.log`) as well as to
+stderr. A log over 1 MB is emptied when the sender starts. The tray menu has "Open log file"
+and "Open config folder". On Windows the tray exe has no console, so when it cannot start (an
+invalid `sender.toml`, already running) it shows a message box with the error and the log path;
+a bad command-line flag is printed to the terminal it was started from, or shown in a message
+box if there is none. The headless build logs to stderr only (the journal under systemd).
 
 ## Linux desktop: tray build
 
@@ -79,7 +99,8 @@ from "Apps & features") asks for admin when the program is under Program Files.
 
 ## Windows: setup.exe (Inno Setup)
 
-Install Inno Setup 6, build with `sender\build.bat`, then
+Each release has `rtm-sender-setup.exe`, built by the release workflow on the Windows runner. To
+build it yourself: install Inno Setup 6, build with `sender\build.bat`, then
 `iscc /DAppVersion=1.2.3 packaging\windows\rtm-sender.iss` (without `/DAppVersion` the version is
 read from `sender\Cargo.toml`). The result is `dist\windows-x86_64\rtm-sender-setup.exe`:
 per-user by default, offers all users, has a "Start rtm-sender when I log in" checkbox (HKCU Run

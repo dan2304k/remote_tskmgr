@@ -72,31 +72,39 @@ class PacketIntake {
   int get errorCount => parseErrors + authFailures + incompatible;
 
   /// Handles raw datagram bytes. Returns true if the packet was ingested.
-  bool handleBytes(List<int> bytes, String source) {
+  bool handleBytes(List<int> bytes, String source) =>
+      ingestBytes(bytes, source) != null;
+
+  /// Like [handleBytes], returning the ingested packet (null when rejected).
+  Packet? ingestBytes(List<int> bytes, String source) {
     final String text;
     try {
       text = utf8.decode(bytes);
     } on FormatException catch (e) {
       parseErrors++;
       lastError = '$source: not valid UTF-8 (${e.message})';
-      return false;
+      return null;
     }
-    return handleText(text, source);
+    return ingestText(text, source);
   }
 
   /// Handles one JSON document. Returns true if the packet was ingested. Never throws:
   /// this runs inside socket callbacks, where an escaped error would kill the listener.
-  bool handleText(String text, String source) {
+  bool handleText(String text, String source) =>
+      ingestText(text, source) != null;
+
+  /// Like [handleText], returning the ingested packet (null when rejected).
+  Packet? ingestText(String text, String source) {
     try {
       return _handleText(text, source);
     } catch (e) {
       parseErrors++;
       lastError = '$source: rejected packet ($e)';
-      return false;
+      return null;
     }
   }
 
-  bool _handleText(String text, String source) {
+  Packet? _handleText(String text, String source) {
     final Packet packet;
     try {
       packet = Packet.parse(text);
@@ -104,23 +112,32 @@ class PacketIntake {
       incompatible++;
       lastIncompatibleSource = source;
       lastError = '$source: ${e.message}';
-      return false;
+      return null;
     } on FormatException catch (e) {
       parseErrors++;
       lastError = '$source: ${e.message}';
-      return false;
+      return null;
     }
     final key = secret();
+    if (key.isNotEmpty) {
+      final bad = authUnsafeNumber(text);
+      if (bad != null) {
+        authFailures++;
+        lastError =
+            '$source: packet from "${packet.host}" cannot be verified: $bad';
+        return null;
+      }
+    }
     if (key.isNotEmpty && !packet.verifyAuth(key)) {
       authFailures++;
       lastError = packet.auth == null
           ? '$source: packet from "${packet.host}" has no auth but a shared secret is set'
           : '$source: auth mismatch for "${packet.host}" (check the shared secret)';
-      return false;
+      return null;
     }
-    if (!registry.ingest(packet, source: source)) return false;
+    if (!registry.ingest(packet, source: source)) return null;
     accepted++;
     onAccepted?.call(packet);
-    return true;
+    return packet;
   }
 }

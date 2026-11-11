@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 import '../config/display_config.dart';
 import '../core/host_registry.dart';
 import 'format.dart';
+import 'grid_math.dart';
 import 'theme.dart';
 import 'widgets/host_card.dart' show AgeText;
 import 'widgets/metric_tile.dart';
@@ -23,7 +24,6 @@ class HostDetailScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final registry = context.watch<HostRegistry>();
     final config = context.watch<DisplayConfig>();
-    final peakHold = config.peakHoldSeconds;
     final host = registry.hosts[hostId];
     if (host == null) {
       return Scaffold(
@@ -31,10 +31,18 @@ class HostDetailScreen extends StatelessWidget {
         body: const Center(child: Text('This host was removed.')),
       );
     }
+    // Per-packet updates come from the host itself, not the registry.
+    return ListenableBuilder(
+      listenable: host.changes,
+      builder: (context, _) => _build(context, config, host),
+    );
+  }
+
+  Widget _build(BuildContext context, DisplayConfig config, HostState host) {
+    final peakHold = config.peakHoldSeconds;
     final metrics = host.latest.metrics;
     final landscape =
         MediaQuery.orientationOf(context) == Orientation.landscape;
-    final perRow = landscape ? 4 : 2;
     final c = RtmColors.of(context);
     final theme = Theme.of(context);
 
@@ -55,7 +63,12 @@ class HostDetailScreen extends StatelessWidget {
             LayoutBuilder(
               builder: (context, box) {
                 const gap = 16.0;
-                final w = (box.maxWidth - gap * (perRow - 1)) / perRow;
+                final perRow = graphColumns(
+                  twoUp: !landscape,
+                  maxWidth: box.maxWidth,
+                  gap: gap,
+                );
+                final w = cellWidth(box.maxWidth, perRow, gap);
                 return Wrap(
                   spacing: gap,
                   runSpacing: gap,

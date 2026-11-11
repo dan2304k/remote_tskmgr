@@ -189,13 +189,6 @@ class DisplayConfig extends ChangeNotifier {
     markChanged();
   }
 
-  /// Moves [id] to [newIndex] (clamped) in [hostOrder], inserting it if absent.
-  void moveHost(String id, int newIndex) {
-    final next = [..._hostOrder]..remove(id);
-    next.insert(newIndex.clamp(0, next.length), id);
-    setHostOrder(next);
-  }
-
   /// Drops [id] from [hostOrder] (host removed from the dashboard).
   void removeHostFromOrder(String id) {
     if (_hostOrder.remove(id)) markChanged();
@@ -254,13 +247,21 @@ class DisplayConfig extends ChangeNotifier {
     kSparklinesDefaultOnKey: true,
   };
 
-  /// Called by NetController when a packet contains a key not in [slots]. Appends a
-  /// visible gauge slot once, whatever the unit ([isPercent] is kept for callers but no
-  /// longer changes the style); no-op if the key exists, even when the user hid it.
-  void ensureSlot(String key, {required bool isPercent}) {
-    if (slotFor(key) != null) return;
-    slots.add(MetricSlot(key: key));
-    markChanged();
+  /// Appends a visible gauge slot for [key] once; no-op if the key exists, even when
+  /// the user hid it. See [ensureSlots].
+  void ensureSlot(String key) => ensureSlots([key]);
+
+  /// Called by NetController with every key of an accepted packet. Appends a visible
+  /// gauge slot for each key not in [slots] yet (whatever the unit), then notifies and
+  /// saves once for the whole batch; no-op when every key exists.
+  void ensureSlots(Iterable<String> keys) {
+    var added = false;
+    for (final key in keys) {
+      if (slotFor(key) != null) continue;
+      slots.add(MetricSlot(key: key));
+      added = true;
+    }
+    if (added) markChanged();
   }
 
   /// Moves the slot at [oldIndex] so it ends up at [newIndex] in the resulting list.
@@ -309,7 +310,12 @@ class DisplayConfig extends ChangeNotifier {
     markChanged();
   }
 
+  /// Number of saves started (tests).
+  @visibleForTesting
+  int saveCount = 0;
+
   Future<void> _saveQuietly() async {
+    saveCount++;
     try {
       await save();
     } catch (e) {

@@ -3,7 +3,7 @@
 //! and the main thread belongs to winit/eframe.
 
 use super::{icon, interval_label, Ctl, GuiEvent, INTERVALS_MS};
-use crate::status::Status;
+use crate::status::{Status, DAEMON_CRASHED};
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,6 +31,14 @@ pub struct TrayView {
 
 impl TrayView {
     pub fn from_status(s: &Status) -> Self {
+        if s.crashed {
+            return Self {
+                status_line: DAEMON_CRASHED.into(),
+                tooltip: format!("rtm-sender · {DAEMON_CRASHED}"),
+                paused: s.paused,
+                interval_ms: s.interval_ms,
+            };
+        }
         if !s.running {
             return Self {
                 status_line: "starting…".into(),
@@ -64,6 +72,8 @@ struct Tray {
     intervals: Vec<(u64, CheckMenuItem)>,
     pause: MenuItem,
     settings: MenuId,
+    open_log: MenuId,
+    open_config: MenuId,
     quit: MenuId,
     last: Option<TrayView>,
 }
@@ -85,6 +95,8 @@ impl Tray {
             .collect();
         let pause = MenuItem::new("Pause sending", true, None);
         let settings = MenuItem::new("Settings…", true, None);
+        let open_log = MenuItem::new("Open log file", true, None);
+        let open_config = MenuItem::new("Open config folder", true, None);
         let quit = MenuItem::new("Quit", true, None);
 
         let menu = Menu::new();
@@ -96,6 +108,9 @@ impl Tray {
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&pause)?;
         menu.append(&settings)?;
+        menu.append(&PredefinedMenuItem::separator())?;
+        menu.append(&open_log)?;
+        menu.append(&open_config)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&quit)?;
 
@@ -112,6 +127,8 @@ impl Tray {
             intervals,
             pause,
             settings: settings.id().clone(),
+            open_log: open_log.id().clone(),
+            open_config: open_config.id().clone(),
             quit: quit.id().clone(),
             last: None,
         })
@@ -123,6 +140,10 @@ impl Tray {
                 ctl.request(GuiEvent::Quit);
             } else if ev.id == self.settings {
                 ctl.request(GuiEvent::OpenSettings);
+            } else if ev.id == self.open_log {
+                open_log(ctl);
+            } else if ev.id == self.open_config {
+                open_path(&ctl.config_dir());
             } else if ev.id == *self.pause.id() {
                 ctl.toggle_pause();
             } else if let Some((ms, _)) = self.intervals.iter().find(|(_, i)| i.id() == &ev.id) {
@@ -171,6 +192,43 @@ impl Tray {
             }
         }
         self.last = Some(view);
+    }
+}
+
+/// The log file in the default app (the folder instead if there is no log yet).
+fn open_log(ctl: &Ctl) {
+    let log = ctl.log_path();
+    if log.is_file() {
+        open_path(&log);
+    } else {
+        tracing::warn!("no log file at {} yet; opening its folder", log.display());
+        open_path(&ctl.config_dir());
+    }
+}
+
+/// Open a file or folder with the desktop's default handler (`explorer` on Windows, `open`
+/// on macOS, `xdg-open` elsewhere). Failures are logged.
+fn open_path(path: &std::path::Path) {
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let opener = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let spawned = std::process::Command::new(opener)
+        .arg(&path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match spawned {
+        // Reap it off this thread (explorer's exit code is meaningless, so it is not checked).
+        Ok(mut child) => {
+            std::thread::spawn(move || child.wait());
+        }
+        Err(e) => tracing::error!("cannot run {opener} {}: {e}", path.display()),
     }
 }
 
@@ -286,6 +344,25 @@ mod tests {
 
         s.interval_ms = 100;
         s.paused = false;
+        s.crashed = true;
+        s.last_error = Some(DAEMON_CRASHED.into());
+        let v = TrayView::from_status(&s);
+        assert_eq!(v.status_line, "daemon stopped unexpectedly");
+        assert_eq!(v.tooltip, "rtm-sender · daemon stopped unexpectedly");
+        let mut s = Status {
+            crashed: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            TrayView::from_status(&s).status_line,
+            DAEMON_CRASHED,
+            "even before the first publish"
+        );
+        s.crashed = false;
+        s.running = true;
+        s.host = "box".into();
+        s.target_count = 1;
+        s.interval_ms = 100;
         assert_eq!(
             TrayView::from_status(&s).status_line,
             "box · 10/s (100 ms) · 1 target"

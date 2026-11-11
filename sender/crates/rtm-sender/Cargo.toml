@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "RTM sender daemon: samples system stats and sends them to viewers"
+# std File::try_lock (single-instance guard). The gui feature needs 1.95+ (eframe 0.37).
+rust-version = "1.89"
+build = "build.rs"
 
 [[bin]]
 name = "rtm-sender"
@@ -40,6 +43,12 @@ gtk = { version = "0.18", optional = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
 winreg = { version = "0.56", optional = true }
+
+# Version resource + icon for the Windows exe. A plain build-dependency (not target-gated):
+# build scripts are compiled for the host, so a cross check from Linux needs it too; build.rs
+# only uses it when CARGO_CFG_TARGET_OS is "windows".
+[build-dependencies]
+winresource = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

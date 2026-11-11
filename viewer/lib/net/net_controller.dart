@@ -101,6 +101,10 @@ class NetController extends ChangeNotifier {
   int get errorCount => _intake.errorCount;
   int get acceptedPackets => _intake.accepted;
 
+  /// Packets the registry dropped as duplicates / reordered (see
+  /// [HostRegistry.droppedOutOfOrder]).
+  int get droppedOutOfOrder => registry.droppedOutOfOrder;
+
   /// Source of the last packet with an unsupported protocol version, for the
   /// "incompatible sender" hint; null if none seen.
   String? get lastIncompatibleSource => _intake.lastIncompatibleSource;
@@ -218,18 +222,15 @@ class NetController extends ChangeNotifier {
     _packetsPerSecond = registry.packetsPerSecond;
     final diag =
         '$_packetsPerSecond $hostCount ${_intake.errorCount} ${_intake.lastError} '
-        '${_intake.lastErrorAge?.inSeconds} $_multicastLockHeld $_wifiLockHeld';
+        '${_intake.lastErrorAge?.inSeconds} $_multicastLockHeld $_wifiLockHeld '
+        '${registry.droppedOutOfOrder}';
     if (diag != _diagSnapshot) {
       _diagSnapshot = diag;
       _notify();
     }
   }
 
-  void _onAccepted(Packet p) {
-    p.metrics.forEach(
-      (key, m) => config.ensureSlot(key, isPercent: m.isPercent),
-    );
-  }
+  void _onAccepted(Packet p) => config.ensureSlots(p.metrics.keys);
 
   String _snapshot() =>
       '${config.udpPort}|${config.tcpEnabled}|${config.tcpPort}';

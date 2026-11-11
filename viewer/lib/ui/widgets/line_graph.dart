@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/host_registry.dart';
@@ -20,10 +21,15 @@ class LineGraph extends StatelessWidget {
     this.peak,
     this.color,
     this.height = 80,
-    this.phase = 0,
+    this.phase,
+    this.values,
   });
 
   final RingBuffer? ring;
+
+  /// Samples to plot; defaults to [ring]'s. Pass a list computed once per packet so
+  /// rebuilds during a value glide do not copy the ring or repaint the plot.
+  final List<double?>? values;
   final double? value;
   final String unit;
   final String label;
@@ -37,8 +43,8 @@ class LineGraph extends StatelessWidget {
   /// Total height, header included.
   final double height;
 
-  /// Scroll offset passed to [Sparkline.phase].
-  final double phase;
+  /// Scroll phase passed to [Sparkline.phase] (repaints the plot only).
+  final ValueListenable<double>? phase;
 
   @override
   Widget build(BuildContext context) {
@@ -109,7 +115,7 @@ class LineGraph extends StatelessWidget {
           Expanded(
             child: LayoutBuilder(
               builder: (context, box) => Sparkline(
-                values: ring?.values ?? const <double?>[],
+                values: values ?? ring?.values ?? const <double?>[],
                 capacity: ring?.capacity,
                 min: min,
                 max: graphMax(max, unit),

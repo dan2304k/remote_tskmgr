@@ -3,9 +3,16 @@
 //!
 //! `\GPU Engine(*)\Utilization Percentage` instance names look like
 //! `pid_1234_luid_0x00000000_0x0000C2B6_phys_0_eng_0_engtype_3D`: one instance per
-//! (process, adapter, engine). Task Manager's headline GPU number is the 3D engine.
+//! (process, adapter, engine).
+//!
+//! Task Manager semantics: one engine is `(luid, phys, eng_N)`; its utilisation is the sum
+//! over the processes using it (capped at 100). An adapter's load is its busiest engine, and
+//! an engine type's load (`detail.engines`) is its busiest engine of that type. Two Copy
+//! engines at 40 % are "Copy 40 %", not 80 %.
 
+use super::adapters::is_auto;
 use serde_json::{Map, Value};
+use std::time::{Duration, Instant};
 
 /// Most engine types listed in `detail.engines`.
 pub const MAX_ENGINES: usize = 6;
@@ -33,15 +40,36 @@ pub fn sum_3d(items: &[(String, f64)]) -> f64 {
     round1(s.min(100.0))
 }
 
-/// Utilisation per engine type (summed over instances, each capped at 100), busiest first,
-/// at most `MAX_ENGINES` entries, as a JSON object for `detail.engines`.
+/// One physical engine: `(luid, phys, eng, engtype)`.
+type EngineKey<'a> = (String, Option<u32>, Option<u32>, &'a str);
+
+/// Utilisation per individual engine, summed over processes and capped at 100. Instances
+/// without a LUID or engine type are ignored.
+fn per_engine(items: &[(String, f64)]) -> Vec<(EngineKey<'_>, f64)> {
+    let mut out: Vec<(EngineKey<'_>, f64)> = Vec::new();
+    for (n, v) in items {
+        let Some(i) = parse_instance(n) else { continue };
+        let Some(t) = i.engtype else { continue };
+        let key = (i.luid, i.phys, i.eng, t);
+        let v = if usable(*v) { *v } else { 0.0 };
+        match out.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, s)) => *s += v,
+            None => out.push((key, v)),
+        }
+    }
+    for (_, s) in &mut out {
+        *s = s.min(100.0);
+    }
+    out
+}
+
+/// Utilisation per engine type (its busiest engine, see the module doc), busiest first, at
+/// most `MAX_ENGINES` entries, as a JSON object for `detail.engines`.
 pub fn engines(items: &[(String, f64)]) -> Map<String, Value> {
     let mut by: Vec<(String, f64)> = Vec::new();
-    for (n, v) in items {
-        let Some(t) = engine_type(n) else { continue };
-        let v = if usable(*v) { *v } else { 0.0 };
+    for ((_, _, _, t), v) in per_engine(items) {
         match by.iter_mut().find(|(k, _)| k == t) {
-            Some((_, s)) => *s += v,
+            Some((_, s)) => *s = s.max(v),
             None => by.push((t.to_string(), v)),
         }
     }
@@ -140,6 +168,8 @@ pub struct Instance<'a> {
     /// Normalised adapter LUID, `0x<high>_0x<low>` in lowercase (see `luid_key`).
     pub luid: String,
     pub phys: Option<u32>,
+    /// `eng_N`: the engine index on that physical adapter.
+    pub eng: Option<u32>,
     pub engtype: Option<&'a str>,
 }
 
@@ -160,13 +190,15 @@ pub fn parse_instance(name: &str) -> Option<Instance<'_>> {
     };
     let high = hex(parts.next())?;
     let low = hex(parts.next())?;
-    let phys = name
-        .split_once("phys_")
-        .and_then(|(_, r)| r.split('_').next())
-        .and_then(|n| n.parse().ok());
+    let num_after = |tag: &str| {
+        name.split_once(tag)
+            .and_then(|(_, r)| r.split('_').next())
+            .and_then(|n| n.parse().ok())
+    };
     Some(Instance {
         luid: luid_key(high, low),
-        phys,
+        phys: num_after("phys_"),
+        eng: num_after("_eng_"),
         engtype: engine_type(name),
     })
 }
@@ -175,8 +207,8 @@ pub fn parse_instance(name: &str) -> Option<Instance<'_>> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdapterLoad {
     pub luid: String,
-    /// Task Manager semantics: the busiest engine type (3D, Compute_0, Copy, VideoDecode, ...),
-    /// each type summed over its instances and capped at 100. Covers compute-only cards.
+    /// Task Manager semantics: the busiest engine (any type: 3D, Compute_0, Copy, ...), each
+    /// engine summed over processes and capped at 100. Covers compute-only cards.
     pub util: f64,
     pub instances: usize,
 }
@@ -206,7 +238,7 @@ pub fn per_adapter(items: &[(String, f64)]) -> Vec<AdapterLoad> {
     out
 }
 
-/// Max over engine types of the per-type sum (each capped at 100), rounded to 0.1.
+/// Max over individual engines of the per-engine sum (each capped at 100), rounded to 0.1.
 pub fn busiest_engine(items: &[(String, f64)]) -> f64 {
     engines(items)
         .values()
@@ -253,12 +285,6 @@ pub struct AdapterInfo {
 pub struct Selection {
     pub luid: String,
     pub reason: &'static str,
-}
-
-/// `metrics.gpu_adapter`: "auto" / empty, else a LUID or a case-insensitive name substring.
-pub fn is_auto(pin: &str) -> bool {
-    let p = pin.trim();
-    p.is_empty() || p.eq_ignore_ascii_case("auto")
 }
 
 /// Does `pin` name this adapter (LUID, its low part, or part of its name)?
@@ -328,6 +354,54 @@ pub fn select_adapter(
         .max_by(|a, b| a.util.total_cmp(&b.util))
         .and_then(|a| pick(&a.luid, "busiest"))
         .or_else(|| luids.first().and_then(|l| pick(l, "only")))
+}
+
+/// The target LUID must be missing for at least this long ...
+pub const LUID_LOST_AFTER: Duration = Duration::from_secs(5);
+/// ... and for at least this many ticks in a row before the adapters are enumerated again.
+pub const LUID_LOST_TICKS: u32 = 2;
+/// After an enumeration that found the target unchanged, wait this long before the next.
+pub const REENUMERATE_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Notices that the reported adapter's LUID has gone from the counter data (a driver reset or
+/// update gives the adapter a new LUID) so the adapter list can be enumerated again; without
+/// this the old LUID would read as a valid-looking 0 % forever.
+#[derive(Debug, Default)]
+pub struct LuidWatch {
+    missing_since: Option<Instant>,
+    ticks: u32,
+    quiet_until: Option<Instant>,
+}
+
+impl LuidWatch {
+    /// `seen`: the LUIDs present in this tick's counter data (engines and adapter memory).
+    /// True when the target has been absent for `LUID_LOST_AFTER` and `LUID_LOST_TICKS`
+    /// ticks while other LUIDs were present: enumerate the adapters again.
+    pub fn observe(&mut self, now: Instant, target: &str, seen: &[&str]) -> bool {
+        if seen.is_empty() || seen.contains(&target) {
+            self.missing_since = None;
+            self.ticks = 0;
+            return false;
+        }
+        if self.quiet_until.is_some_and(|q| now < q) {
+            return false;
+        }
+        let since = *self.missing_since.get_or_insert(now);
+        self.ticks += 1;
+        if self.ticks >= LUID_LOST_TICKS && now.saturating_duration_since(since) >= LUID_LOST_AFTER
+        {
+            self.missing_since = None;
+            self.ticks = 0;
+            return true;
+        }
+        false
+    }
+
+    /// Report the outcome of an enumeration: `changed` false (same target LUID) waits
+    /// `REENUMERATE_COOLDOWN` before trying again.
+    pub fn enumerated(&mut self, now: Instant, changed: bool) {
+        self.quiet_until = (!changed).then(|| now + REENUMERATE_COOLDOWN);
+    }
 }
 
 fn round1(v: f64) -> f64 {
@@ -486,9 +560,13 @@ mod tests {
             parse_instance("pid_1234_luid_0x00000000_0x0000C2B6_phys_0_eng_3_engtype_3D").unwrap();
         assert_eq!(i.luid, IGPU);
         assert_eq!(i.phys, Some(0));
+        assert_eq!(i.eng, Some(3));
         assert_eq!(i.engtype, Some("3D"));
         let m = parse_instance("luid_0x00000000_0x0001D3A4_phys_1").unwrap();
-        assert_eq!((m.luid.as_str(), m.phys, m.engtype), (DGPU, Some(1), None));
+        assert_eq!(
+            (m.luid.as_str(), m.phys, m.eng, m.engtype),
+            (DGPU, Some(1), None, None)
+        );
         let c = parse_instance("pid_9_luid_0x00000001_0xFFFFFFFF_phys_0_eng_9_engtype_Compute_1")
             .unwrap();
         assert_eq!(c.luid, "0x00000001_0xffffffff");
@@ -528,6 +606,69 @@ mod tests {
             ("luid_0x00000000_0x0001D3A4_phys_1".into(), 2.0),
         ]);
         assert_eq!(mem, [(DGPU.to_string(), 5.0)]);
+    }
+
+    fn engine_n(luid_hi_lo: &str, pid: u32, n: u32, engtype: &str, v: f64) -> (String, f64) {
+        let (name, v) = eng(luid_hi_lo, pid, engtype, v);
+        (name.replace("_eng_0_", &format!("_eng_{n}_")), v)
+    }
+
+    #[test]
+    fn engines_of_one_type_are_not_added_together() {
+        // Two Copy engines at 40 % each: Copy is 40 %, not 80 %.
+        let items = vec![
+            engine_n(DGPU, 1, 1, "Copy", 40.0),
+            engine_n(DGPU, 2, 2, "Copy", 40.0),
+            engine_n(DGPU, 1, 0, "3D", 25.0),
+            engine_n(DGPU, 2, 0, "3D", 10.0), // same engine, other process: summed
+        ];
+        assert_eq!(busiest_engine(&items), 40.0);
+        assert_eq!(per_adapter(&items)[0].util, 40.0);
+        let e = engines(&items);
+        assert_eq!(e["Copy"], Value::from(40.0));
+        assert_eq!(e["3D"], Value::from(35.0));
+        // The same engine index on another physical adapter of a linked pair is another engine.
+        let linked = vec![
+            engine_n(DGPU, 1, 0, "3D", 60.0),
+            (
+                engine_n(DGPU, 2, 0, "3D", 60.0)
+                    .0
+                    .replace("phys_0", "phys_1"),
+                60.0,
+            ),
+        ];
+        assert_eq!(busiest_engine(&linked), 60.0);
+        // Engines on different adapters never add up either.
+        let two = vec![eng(IGPU, 1, "3D", 50.0), eng(DGPU, 1, "3D", 50.0)];
+        assert_eq!(engines(&two)["3D"], Value::from(50.0));
+    }
+
+    #[test]
+    fn luid_watch_needs_time_ticks_and_other_adapters() {
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let mut w = LuidWatch::default();
+        // Target present, or no data at all: never.
+        assert!(!w.observe(s(0), DGPU, &[DGPU, IGPU]));
+        for i in 0..20 {
+            assert!(!w.observe(s(i), DGPU, &[]));
+        }
+        // Missing while another adapter is present: after 5 s and 2 ticks.
+        assert!(!w.observe(s(100), DGPU, &[IGPU]));
+        assert!(!w.observe(s(103), DGPU, &[IGPU]));
+        assert!(w.observe(s(105), DGPU, &[IGPU]));
+        // Enumeration found the same LUID (e.g. an idle card): quiet for a minute.
+        w.enumerated(s(105), false);
+        for i in 106..165 {
+            assert!(!w.observe(s(i), DGPU, &[IGPU]));
+        }
+        assert!(!w.observe(s(165), DGPU, &[IGPU]));
+        assert!(w.observe(s(170), DGPU, &[IGPU]));
+        // Seeing the target again resets the count; a long single tick is not enough.
+        w.enumerated(s(170), true);
+        assert!(!w.observe(s(171), DGPU, &[DGPU]));
+        assert!(!w.observe(s(200), DGPU, &[IGPU]));
+        assert!(w.observe(s(3600), DGPU, &[IGPU]));
     }
 
     fn load(luid: &str, util: f64, n: usize) -> AdapterLoad {

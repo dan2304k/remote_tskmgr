@@ -222,6 +222,25 @@ fn validation_errors() {
     c.network.udp_unicast = vec!["192.168.1.60".into(), "no-such-host.invalid".into()];
     c.network.tcp_unicast = vec!["viewer.lan:48001".into()];
     c.validate().unwrap();
+    // gpu_adapter: auto, #N, or a non-empty part of a name.
+    for ok in [
+        "auto",
+        "AUTO",
+        "#0",
+        "# 2",
+        "R9700",
+        "0x00000000_0x0000c2b6",
+    ] {
+        c.metrics.gpu_adapter = ok.into();
+        c.validate().unwrap();
+    }
+    for bad in ["", "  ", "#", "#x", "#-1"] {
+        assert!(invalid(|c| c.metrics.gpu_adapter = bad.into()).contains("gpu_adapter"));
+    }
+    assert!(
+        invalid(|c| c.metrics.disk_include = vec!["sda".into(), " ".into()])
+            .contains("disk_include")
+    );
 }
 
 #[test]
@@ -293,15 +312,28 @@ fn bare_ip_round_trips_and_uses_udp_port() {
 }
 
 #[test]
-fn unresolvable_host_is_skipped_not_fatal() {
+fn host_names_are_passed_on_unresolved() {
     let mut c = Config::default();
     c.network.udp_broadcast = false;
-    c.network.udp_unicast = vec!["no-such-host.invalid".into(), "localhost".into()];
+    c.network.udp_unicast = vec!["no-such-host.invalid".into(), "10.0.0.7".into()];
+    c.network.tcp_unicast = vec!["Viewer.LAN:48001".into()];
     let r = c.resolve_targets().unwrap();
-    assert_eq!(r.targets.len(), 1);
-    assert_eq!(r.unresolved.len(), 1);
-    assert_eq!(r.unresolved[0].0.to_string(), "no-such-host.invalid:48000");
-    assert_eq!(c.to_targets().unwrap().len(), 1);
+    assert!(r.unresolved.is_empty());
+    assert_eq!(
+        r.targets,
+        [
+            rtm_net::Target::UdpHost {
+                host: "no-such-host.invalid".into(),
+                port: 48000
+            },
+            rtm_net::Target::UdpUnicast("10.0.0.7:48000".parse().unwrap()),
+            rtm_net::Target::TcpHost {
+                host: "viewer.lan".into(),
+                port: 48001
+            },
+        ]
+    );
+    assert_eq!(c.to_targets().unwrap(), r.targets);
     // The plan (used to diff reloads) needs no DNS.
     let p = c.target_plan().unwrap();
     assert_eq!(
@@ -380,6 +412,7 @@ fn full_hand_written_toml_parses() {
     assert_eq!(cc.enabled, vec!["cpu", "mem", "net"]);
     assert_eq!(cc.gpu_backend, rtm_collect::GpuBackend::Amdgpu);
     assert_eq!(cc.disk_include, vec!["nvme0n1".to_string()]);
+    assert_eq!(cc.net_skip_prefixes, vec!["docker".to_string()]);
 
     let t = c.to_targets().unwrap();
     assert_eq!(

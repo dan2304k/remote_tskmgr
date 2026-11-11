@@ -3,8 +3,8 @@
 //!
 //! * `\GPU Engine(*)\Utilization Percentage`: one instance per (process, adapter, engine).
 //!   Instances are grouped by the adapter LUID in their name. Per adapter, `v` is the busiest
-//!   engine type (each type summed over processes, capped at 100): Task Manager's semantics,
-//!   so compute-only work (AI on a card that drives no display) counts.
+//!   engine (each engine summed over processes, capped at 100): Task Manager's semantics, so
+//!   compute-only work (AI on a card that drives no display) counts.
 //! * `\GPU Adapter Memory(*)\Dedicated Usage`: bytes per adapter -> `vram_used_mb`.
 //!
 //! The reported adapter is `gpu_adapter` if set, else the one with the most dedicated VRAM
@@ -22,11 +22,15 @@
 //!
 //! `detail.engines` lists utilisation per engine type (at most 6, busiest first) so a user
 //! whose GPU work is not on the 3D engine (e.g. video decode) can see where it is.
+//!
+//! A driver reset or update gives the adapter a new LUID. When the target LUID has vanished
+//! from the counter data while other adapters are present (`pdh_parse::LuidWatch`), the
+//! adapters are enumerated again (DXGI) and `gpu_adapter` is resolved anew.
 
-use super::adapters::{adapters_detail, Adapter};
+use super::adapters::{self, adapters_detail, Adapter};
 use super::pdh_parse::{
     self, classify_array, classify_collect, engines, of_adapter, per_adapter, per_luid,
-    select_adapter, AdapterInfo, AdapterLoad, EngineRead, UtilFilter,
+    select_adapter, AdapterInfo, AdapterLoad, EngineRead, LuidWatch, UtilFilter,
 };
 use super::GpuSource;
 use crate::util::MIB;
@@ -63,6 +67,9 @@ pub struct PdhSource {
     list: Vec<Adapter>,
     target: Option<Adapter>,
     pinned: bool,
+    /// `gpu_adapter` as configured, for re-resolving after the adapter list changed.
+    pin: String,
+    watch: LuidWatch,
     /// Last chosen adapter LUID and reason, kept for ticks without valid instances.
     chosen: Option<(String, &'static str)>,
     loads: Vec<AdapterLoad>,
@@ -74,7 +81,12 @@ pub struct PdhSource {
 unsafe impl Send for PdhSource {}
 
 impl PdhSource {
-    pub fn new(list: Vec<Adapter>, target: Option<Adapter>, pinned: bool) -> Result<Self, String> {
+    pub fn new(
+        list: Vec<Adapter>,
+        target: Option<Adapter>,
+        pinned: bool,
+        pin: String,
+    ) -> Result<Self, String> {
         unsafe {
             let mut query = PDH_HQUERY::default();
             let st = PdhOpenQueryW(PCWSTR::null(), 0, &mut query);
@@ -119,10 +131,38 @@ impl PdhSource {
                 list,
                 target,
                 pinned,
+                pin,
+                watch: LuidWatch::default(),
                 chosen: None,
                 loads: Vec::new(),
             })
         }
+    }
+}
+
+impl PdhSource {
+    /// The target LUID vanished: enumerate the adapters again and resolve `gpu_adapter`.
+    fn reselect(&mut self, now: std::time::Instant) {
+        let list = super::dxgi::list();
+        let (target, pinned) = adapters::resolve(&list, &self.pin);
+        // A registry-fallback adapter has no LUID: leave the choice to the heuristics.
+        let target = target.filter(|t| t.id.starts_with("0x"));
+        let id = |t: &Option<Adapter>| t.as_ref().map(|t| t.id.clone());
+        let changed = id(&target) != id(&self.target);
+        if changed {
+            tracing::info!(
+                from = ?id(&self.target),
+                to = ?target.as_ref().map(Adapter::label),
+                "gpu: adapter LUID changed (driver reset or update?); re-selected"
+            );
+            self.chosen = None;
+        } else {
+            tracing::debug!("gpu: target LUID absent from PDH data but still listed by DXGI");
+        }
+        self.watch.enumerated(now, changed);
+        self.list = list;
+        self.target = target;
+        self.pinned = pinned;
     }
 }
 
@@ -215,6 +255,22 @@ impl GpuSource for PdhSource {
         };
         if let EngineRead::Values(items) = &read {
             self.loads = per_adapter(items);
+        }
+        if matches!(read, EngineRead::Values(_) | EngineRead::NoInstances) {
+            if let Some(t) = &self.target {
+                let fresh = matches!(read, EngineRead::Values(_));
+                let seen: Vec<&str> = mem
+                    .iter()
+                    .map(|(l, _)| l.as_str())
+                    .chain(self.loads.iter().filter(|_| fresh).map(|a| a.luid.as_str()))
+                    .collect();
+                let now = std::time::Instant::now();
+                if self.watch.observe(now, &t.id, &seen) {
+                    self.reselect(now);
+                }
+            }
+        }
+        if let EngineRead::Values(_) = &read {
             self.chosen = match &self.target {
                 Some(t) => Some((
                     t.id.clone(),

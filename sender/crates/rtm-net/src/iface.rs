@@ -61,10 +61,26 @@ pub fn default_route_ip() -> Option<Ipv4Addr> {
     }
 }
 
+/// Does `name` start with one of `prefixes` (case-sensitive; empty prefixes ignored)? The
+/// name must equal the prefix or continue with something other than an ASCII lowercase
+/// letter, so `lo` matches `lo` / `lo0` but not `local`, and `docker` matches `docker0`.
+/// Windows names such as "Local Area Connection" or "vEthernet (External)" (which can be the
+/// main NIC) are never caught by the default list.
+pub fn skipped_by_prefix(name: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().map(|p| p.trim()).any(|p| {
+        !p.is_empty()
+            && name.starts_with(p)
+            && !name[p.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase())
+    })
+}
+
 /// Pick directed-broadcast destinations.
 ///
 /// * Always skipped: loopback, links reported down, interfaces without a broadcast address.
-/// * `All`: additionally skips names starting with any of `skip_prefixes`.
+/// * `All`: additionally skips names matched by `skip_prefixes` (see [`skipped_by_prefix`]).
 /// * `Default`: the interface owning `default_ip`; falls back to `All` when there is none.
 /// * `Named`: exactly the listed names (the skip list does not apply to explicit picks).
 ///
@@ -77,11 +93,7 @@ pub fn select_broadcast(
     default_ip: Option<Ipv4Addr>,
 ) -> Vec<BroadcastDest> {
     let usable = |i: &&IfaceInfo| i.up && !i.loopback && i.broadcast.is_some();
-    let skipped = |i: &IfaceInfo| {
-        skip_prefixes
-            .iter()
-            .any(|p| !p.is_empty() && i.name.starts_with(p.as_str()))
-    };
+    let skipped = |i: &IfaceInfo| skipped_by_prefix(&i.name, skip_prefixes);
     let picked: Vec<&IfaceInfo> = match sel {
         BroadcastInterfaces::All => ifaces
             .iter()
@@ -210,6 +222,40 @@ mod tests {
             &skip(),
             Some([1, 2, 3, 4].into()),
         );
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn skip_prefix_matching() {
+        for n in ["lo", "lo0", "docker0", "br-1ee4", "veth12ab", "virbr0"] {
+            assert!(skipped_by_prefix(n, &skip()), "{n}");
+        }
+        for n in [
+            "Local Area Connection",
+            "local0",
+            "vEthernet (External)",
+            "vethernet",
+            "enp0s31f6",
+            "Ethernet",
+            "Docker1",
+        ] {
+            assert!(!skipped_by_prefix(n, &skip()), "{n}");
+        }
+        assert!(!skipped_by_prefix("eth0", &["".into(), " ".into()]));
+        // Windows-style list: the main NIC behind a Hyper-V switch keeps broadcasting.
+        let l = vec![
+            ifc(
+                "vEthernet (External)",
+                [192, 168, 1, 9],
+                Some([192, 168, 1, 255]),
+            ),
+            ifc(
+                "Local Area Connection",
+                [10, 1, 0, 2],
+                Some([10, 1, 0, 255]),
+            ),
+        ];
+        let r = select_broadcast(&l, &BroadcastInterfaces::All, &skip(), None);
         assert_eq!(r.len(), 2);
     }
 

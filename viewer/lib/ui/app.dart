@@ -125,13 +125,15 @@ class _RtmAppState extends State<RtmApp> {
         ChangeNotifierProvider<HostRegistry>.value(value: widget.registry),
         ChangeNotifierProvider<NetController>.value(value: widget.net),
       ],
-      child: Consumer<DisplayConfig>(
-        builder: (context, cfg, _) => MaterialApp(
+      // Only the theme mode rebuilds the root; everything else selects its own config.
+      child: Selector<DisplayConfig, ThemeMode>(
+        selector: (_, cfg) => cfg.themeMode,
+        builder: (context, themeMode, _) => MaterialApp(
           title: 'RTM Viewer',
           debugShowCheckedModeBanner: false,
           theme: rtmLightTheme,
           darkTheme: rtmDarkTheme,
-          themeMode: cfg.themeMode,
+          themeMode: themeMode,
           initialRoute: DashboardScreen.route,
           onGenerateRoute: (s) => MaterialPageRoute(
             settings: s,

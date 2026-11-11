@@ -7,6 +7,7 @@ import '../core/host_registry.dart';
 import '../net/net_controller.dart';
 import 'format.dart';
 import 'host_order.dart';
+import 'widgets/host_card.dart' show AgeText;
 import 'dashboard_screen.dart' show cardLayoutIcon;
 import 'theme.dart';
 
@@ -129,6 +130,7 @@ class _Diagnostics extends StatelessWidget {
       '${net.packetsPerSecond} pkts/s',
       '${net.hostCount} hosts',
       '${net.tcpConnections} tcp',
+      if (net.droppedOutOfOrder > 0) '${net.droppedOutOfOrder} out of order',
       net.running ? 'running' : 'stopped',
       if (net.bindError != null) net.bindError!,
       if (net.lastPacketError != null)
@@ -615,8 +617,12 @@ class _HostsSection extends StatelessWidget {
               ),
             ),
             title: Text(h.latest.host),
-            subtitle: Text(
-              '${h.status.name} · ${ageText(h.lastSeen, DateTime.now())}',
+            // The registry no longer notifies per packet: AgeText refreshes itself.
+            subtitle: Row(
+              children: [
+                Text('${h.status.name} · '),
+                AgeText(lastSeen: h.lastSeen),
+              ],
             ),
             trailing: h.status == HostStatus.offline
                 ? TextButton(

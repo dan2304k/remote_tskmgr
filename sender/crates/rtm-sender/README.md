@@ -16,8 +16,15 @@ cargo build --release -p rtm-sender                  # headless, ~1.8 MB on Linu
 cargo build --release -p rtm-sender --features gui   # tray + settings, ~8.5 MB
 ```
 
-The `gui` feature needs a newer compiler than the headless build (eframe 0.37 declares
-rust-version 1.95).
+The headless build needs Rust 1.89+ (`File::try_lock`); the `gui` feature needs 1.95+
+(eframe 0.37 declares rust-version 1.95).
+
+For Windows targets `build.rs` embeds a version resource (the crate version, shown in
+Explorer → Properties → Details and by Inno Setup) and `assets/icon.ico` as the exe icon, using
+the `winresource` crate (rc.exe from the Windows SDK with MSVC, windres with GNU). If no
+resource compiler is found, e.g. a cross `cargo check --target x86_64-pc-windows-gnu` from
+Linux, it prints a cargo warning and builds without them; `RTM_REQUIRE_WINRES=1` (set in CI)
+makes that an error.
 
 ### Linux build dependencies for `gui`
 
@@ -50,7 +57,27 @@ with comments on first run and hot-reloaded when edited. Command-line flags (`--
 keep overriding it after edits from the GUI.
 
 On Windows the `gui` build attaches to the parent console when started with `--once`,
-`--print-config`, `--help` or `--version`, so their output still appears in the terminal.
+`--print-config`, `--help` or `--version`, so their output still appears in the terminal. A
+command-line error is printed to the parent console too, or shown in a message box when there
+is none.
+
+### Single instance
+
+One sender per config file: the sender holds an exclusive lock on `<config>.lock` (for
+example `sender.toml.lock`, next to the config) while it runs. A second copy with the same
+config exits with exit code 3 and "rtm-sender is already running with config …" on stderr
+(and, in GUI mode, in the log and on Windows in a message box). `--once` and
+`--print-config` do not take the lock. The OS releases it when the process ends, however it
+ends; the file stays and is harmless.
+
+### Log file
+
+In GUI mode (the `gui` build, unless `--once` or `--print-config`) the log goes to stderr and
+is also appended to `sender.log` in the config file's folder, `--no-gui` included. If that file
+is over 1 MB at start-up it is emptied first; there is no other rotation. `RTM_LOG` and `-v`
+apply to both. When the Windows `gui` build stops on an error (invalid `sender.toml`, already
+running) and stderr goes nowhere, it shows a message box with the error and the log path; with
+stderr redirected or a console attached it only prints.
 
 ## Tray and settings window (`gui`)
 
@@ -61,7 +88,9 @@ config file and the daemon's control channel (reload, pause, shutdown).
 
 Tray menu:
 
-* **status line**: host · interval · number of targets (plus "paused" or "send error").
+* **status line**: host · interval · number of targets (plus "paused" or "send error"), or
+  "daemon stopped unexpectedly" if the daemon thread panicked (unwinding dev builds only; the
+  release profile aborts the process).
   On Windows the same text is the icon's tooltip. Linux AppIndicator has no tooltips.
 * **Interval 10/s (100 ms) / 5/s (200 ms) / 1 s / 5 s / 15 s / 30 s**: writes
   `general.interval_ms` to the TOML and applies it immediately. The same choices are in
@@ -71,9 +100,13 @@ Tray menu:
   instead of showing an empty CPU gauge or spiky rates. Each packet still has its own `seq`
   and timestamp.
 * **Pause sending / Resume sending**: while paused the loop keeps sampling (so the first packet
-  after resuming has correct rates) but sends nothing. Pause is not saved: a restart always
+  after resuming has correct rates) but builds and sends nothing; `seq` does not advance, so the
+  first packet after resuming follows the last one sent. Pause is not saved: a restart always
   sends. The icon is greyed out while paused.
 * **Settings…** opens the settings window. On Windows a left click on the icon does the same.
+* **Open log file** opens `sender.log` in the default app (its folder if there is no log
+  yet); **Open config folder** opens the folder with `sender.toml`. Uses `explorer` (Windows),
+  `open` (macOS) or `xdg-open` (Linux).
 * **Quit** stops the daemon cleanly and exits.
 
 Settings window: General (host name, interval), Network (broadcast on/off and port, interfaces
@@ -84,10 +117,10 @@ Startup (start minimized, show a splash on start, start at login).
 * **Unicast targets** accept `192.168.1.50`, `192.168.1.50:48001`, `[fe80::1]:48000`,
   `viewer.lan` or `viewer.lan:48001`. Without a port the UDP broadcast port (`udp_port`,
   48000 by default) is used. The address that packets will go to is shown under each row,
-  e.g. "sends to 192.168.1.50:48000". Rows are stored as typed. Host names are looked up when
-  the config is applied, with the first IPv4 address preferred. A name that does not resolve
-  is logged and skipped, and it is looked up again on the next config reload (Save, or an
-  edit to the file). Errors are short, wrap under the row, and the full text is on the
+  e.g. "sends to 192.168.1.50:48000". Rows are stored as typed. Host names are looked up in the
+  background, with IPv4 addresses preferred: UDP names every 60 s (the last good address is
+  kept while lookups fail, nothing is sent before the first success), TCP names before every
+  connect attempt. A viewer whose address changes is followed without a config reload. Errors are short, wrap under the row, and the full text is on the
   red "!" tooltip.
 * **GPU backend** shows readable names. The values in the file stay the same:
 
@@ -118,7 +151,7 @@ When the sender starts minimized, a small borderless note appears for about 3 se
 bottom-right corner of the primary screen, next to the Windows notification area. It shows
 the icon, "rtm-sender is running", where to find the tray icon, and a bar that runs down.
 Click it to close it early. The daemon is already sending while it shows. Quit or Settings…
-in the tray also work during that time. Turn it off with `gui.show_splash = false`, or untick
+in the tray also work during that time, including one chosen just as it closes. Turn it off with `gui.show_splash = false`, or untick
 Settings → Startup → "Show a splash on start". No splash appears when `start_minimized =
 false`, because the settings window opens instead. On Linux the work area is not known, so
 the note is placed 48 px above the bottom-right corner. Wayland compositors choose the
@@ -223,4 +256,5 @@ cargo test -p rtm-sender --features gui   # also runs the GUI model tests; needs
 ```
 
 The tray icons in `assets/` are generated by `gui::icon::render`. After changing the drawing,
-regenerate them with `RTM_REGEN_ICONS=1 cargo test -p rtm-sender --features gui icon`.
+regenerate them with `RTM_REGEN_ICONS=1 cargo test -p rtm-sender --features gui icon`. The
+same command rewrites `assets/icon.ico` (16–256 px, PNG entries), the Windows exe icon.

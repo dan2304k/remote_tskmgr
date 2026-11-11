@@ -7,8 +7,10 @@ import 'package:provider/provider.dart';
 import '../../config/display_config.dart';
 import '../../core/host_registry.dart';
 import '../format.dart';
+import '../grid_math.dart';
 import '../theme.dart';
 import 'metric_tile.dart';
+import 'value_follower.dart';
 
 /// Visible slots in display order, limited to metrics [host] has reported recently
 /// ([HostState.isMetricRecent] at [now]), so a metric the sender stopped sending drops
@@ -29,7 +31,9 @@ List<MetricSlot> visibleSlots(
   return [for (final k in host.latest.metrics.keys) MetricSlot(key: k)];
 }
 
-/// One host on the dashboard. Rebuilds itself on registry/config changes.
+/// One host on the dashboard. Rebuilds on its own host's [HostState.changes], on
+/// registry-level changes (host set / status) and on config changes; a packet for
+/// another host does not rebuild it.
 class HostCard extends StatelessWidget {
   const HostCard({
     super.key,
@@ -44,6 +48,10 @@ class HostCard extends StatelessWidget {
   final bool compact;
   final VoidCallback? onTap;
 
+  /// Test hook: called with [hostId] each time a card body is built.
+  @visibleForTesting
+  static void Function(String hostId)? debugOnBuild;
+
   @override
   Widget build(BuildContext context) {
     final registry = context.read<HostRegistry>();
@@ -53,7 +61,15 @@ class HostCard extends StatelessWidget {
       builder: (context, _) {
         final host = registry.hosts[hostId];
         if (host == null) return const SizedBox.shrink();
-        return _buildCard(context, registry, config, host);
+        // The host object can change (removed and heard again), so the inner builder
+        // re-subscribes whenever the outer one runs.
+        return ListenableBuilder(
+          listenable: host.changes,
+          builder: (context, _) {
+            debugOnBuild?.call(hostId);
+            return _buildCard(context, registry, config, host);
+          },
+        );
       },
     );
   }
@@ -269,45 +285,52 @@ class _Body extends StatelessWidget {
   );
 
   /// Line graphs: 2 per row on a portrait phone, 4 across otherwise. If 4 would be
-  /// narrower than ~56 dp each, fall back to 2 (never an uneven 3 + 1).
+  /// narrower than ~56 dp each, fall back to 2 (never an uneven 3 + 1). One scroll-phase
+  /// driver per card feeds every graph's painter.
   Widget _lines(BuildContext context) {
     final size = MediaQuery.sizeOf(context);
     final portraitPhone =
         size.shortestSide < 600 &&
         MediaQuery.orientationOf(context) == Orientation.portrait;
-    return LayoutBuilder(
-      builder: (context, box) {
-        final w = box.maxWidth;
-        const gap = 8.0;
-        const minW = 56.0;
-        double widthFor(int n) => (w - gap * (n - 1)) / n;
-        var perRow = portraitPhone ? 2 : 4;
-        while (perRow > 1 && widthFor(perRow) < minW) {
-          perRow ~/= 2;
-        }
-        perRow = math.max(1, math.min(perRow, slots.length));
-        final tileW = widthFor(perRow);
-        final height = (tileW * 0.55).clamp(compact ? 56.0 : 64.0, 120.0);
-        return Wrap(
-          spacing: gap,
-          runSpacing: gap,
-          children: [
-            for (final s in slots)
-              SizedBox(
-                key: ValueKey('line-${host.id}-${s.key}'),
-                width: tileW,
-                child: MetricLineGraph(
-                  host: host,
-                  slot: s,
-                  peakHoldSeconds: peakHoldSeconds,
-                  smoothingWindowMs: smoothingWindowMs,
-                  smoothAnimation: smoothAnimation,
-                  height: height,
+    return ScrollPhase(
+      sampleKey: host.latest.seq,
+      interval: host.interval,
+      enabled: smoothAnimation,
+      builder: (context, phase) => LayoutBuilder(
+        builder: (context, box) {
+          final w = box.maxWidth;
+          const gap = 8.0;
+          final perRow = graphColumns(
+            twoUp: portraitPhone,
+            maxWidth: w,
+            gap: gap,
+            minWidth: 56,
+            count: slots.length,
+          );
+          final tileW = cellWidth(w, perRow, gap);
+          final height = (tileW * 0.55).clamp(compact ? 56.0 : 64.0, 120.0);
+          return Wrap(
+            spacing: gap,
+            runSpacing: gap,
+            children: [
+              for (final s in slots)
+                SizedBox(
+                  key: ValueKey('line-${host.id}-${s.key}'),
+                  width: tileW,
+                  child: MetricLineGraph(
+                    host: host,
+                    slot: s,
+                    peakHoldSeconds: peakHoldSeconds,
+                    smoothingWindowMs: smoothingWindowMs,
+                    smoothAnimation: smoothAnimation,
+                    height: height,
+                    phase: phase,
+                  ),
                 ),
-              ),
-          ],
-        );
-      },
+            ],
+          );
+        },
+      ),
     );
   }
 
@@ -324,7 +347,7 @@ class _Body extends StatelessWidget {
         final perRow = compact
             ? math.min(n, fit)
             : math.min(n, math.min(fit, 6));
-        final tileW = (w - _gap * (perRow - 1)) / perRow;
+        final tileW = cellWidth(w, perRow, _gap);
         final gauge = compact ? math.min(tileW, 84.0) : math.min(tileW, 120.0);
         return Wrap(
           spacing: _gap,

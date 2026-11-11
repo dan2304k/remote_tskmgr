@@ -19,8 +19,7 @@
 use serde_json::{Map, Value};
 use std::sync::Mutex;
 
-pub(crate) const VENDOR_NVIDIA: u16 = 0x10de;
-pub(crate) const VENDOR_INTEL: u16 = 0x8086;
+pub(crate) use super::sysfs::{VENDOR_INTEL, VENDOR_NVIDIA};
 
 /// One detected GPU.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +178,7 @@ pub fn from_sysfs_with(
         .collect()
 }
 
+/// `gpu_adapter` means "auto" (also when empty).
 pub fn is_auto(pin: &str) -> bool {
     let p = pin.trim();
     p.is_empty() || p.eq_ignore_ascii_case("auto")

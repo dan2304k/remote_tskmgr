@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rtm_viewer/core/host_registry.dart';
 import 'package:rtm_viewer/core/packet.dart';
@@ -118,5 +119,65 @@ void main() {
       isFalse,
     );
     expect(intake.lastError, contains('boom'));
+  });
+
+  group('auth: numbers the canonical body cannot reproduce', () {
+    const key = 'correct horse';
+
+    /// valid_full.json signed the way a correct sender would sign it, with the cpu
+    /// value spelled [literal] on the wire and in the canonical body.
+    String signedWith(String literal, {int seq = 1}) {
+      final j = fixtureJson('valid_full.json')..remove('auth');
+      j['seq'] = seq;
+      (j['metrics'] as Map)['cpu']['v'] = 12345.5;
+      final body = Packet.canonicalBody(j).replaceFirst('12345.5', literal);
+      final mac = Hmac(sha256, utf8.encode(key)).convert(utf8.encode(body));
+      j['auth'] = mac.toString();
+      return jsonEncode(j).replaceFirst('12345.5', literal);
+    }
+
+    late PacketIntake authed;
+    setUp(() => authed = PacketIntake(registry: registry, secret: () => key));
+
+    test('control: an ordinary signed value verifies', () {
+      expect(authed.handleText(signedWith('42'), 's'), isTrue);
+      expect(
+        authed.handleText(signedWith('-9223372036854775808', seq: 2), 's'),
+        isTrue,
+      );
+    });
+
+    for (final (literal, why) in [
+      ('-0', '-0'),
+      ('9223372036854775808', 'outside the 64-bit range'),
+      ('-9223372036854775809', 'outside the 64-bit range'),
+      ('18446744073709551615', 'outside the 64-bit range'),
+    ]) {
+      test('$literal is rejected with a reason when a secret is set', () {
+        expect(authed.handleText(signedWith(literal), 's'), isFalse);
+        expect(authed.authFailures, 1);
+        expect(authed.lastError, contains(why));
+        expect(registry.hosts, isEmpty);
+      });
+
+      test('$literal is accepted when no secret is set', () {
+        expect(intake.handleText(withCpuLiteral(literal), 's'), isTrue);
+      });
+    }
+
+    test('non-finite is rejected as a parse error, secret or not', () {
+      expect(authed.handleText(signedWith('1e400'), 's'), isFalse);
+      expect(authed.parseErrors, 1);
+      expect(authed.authFailures, 0);
+    });
+
+    test('scanner ignores numbers inside strings; floats are fine', () {
+      expect(authUnsafeNumber('{"a":"-0","b":"99999999999999999999"}'), isNull);
+      expect(authUnsafeNumber(r'{"a":"x\"-0","b":-0.0,"c":-0e0}'), isNull);
+      expect(authUnsafeNumber('{"a":[1,-0]}'), 'integer -0');
+      expect(authUnsafeNumber('{"a":-0}'), 'integer -0');
+      expect(authUnsafeNumber('{"a":9223372036854775807}'), isNull);
+      expect(authUnsafeNumber('{"a":12345678901234567890.5}'), isNull);
+    });
   });
 }

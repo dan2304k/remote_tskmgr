@@ -171,5 +171,17 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.textContaining('auth mismatch (12 s ago)'), findsOneWidget);
     });
+
+    testWidgets('diagnostics row shows out-of-order drops', (tester) async {
+      setScreen(tester, 400, 3000);
+      registry.droppedOutOfOrder = 7;
+      await tester.pumpWidget(app());
+      await tester.pump();
+      tester
+          .state<NavigatorState>(find.byType(Navigator))
+          .pushNamed(SettingsScreen.route);
+      await tester.pumpAndSettle();
+      expect(find.textContaining('7 out of order'), findsOneWidget);
+    });
   });
 }

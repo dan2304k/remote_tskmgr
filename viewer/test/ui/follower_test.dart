@@ -45,10 +45,11 @@ void main() {
       expect(followerTau(const Duration(seconds: 10)), t500);
     });
 
-    test('settle threshold is 0.05 % of range', () {
-      expect(followerSettled(99.96, 100, 100), isTrue);
-      expect(followerSettled(99.9, 100, 100), isFalse);
-      expect(followerSettled(0.4, 0, 1000), isTrue);
+    test('settle threshold is 0.4 % of range (display precision)', () {
+      expect(followerSettled(99.65, 100, 100), isTrue);
+      expect(followerSettled(99.5, 100, 100), isFalse);
+      expect(followerSettled(4, 0, 1000), isTrue);
+      expect(followerSettled(5, 0, 1000), isFalse);
     });
   });
 
@@ -190,10 +191,15 @@ void main() {
         theme: rtmDarkTheme,
         home: SizedBox(
           width: 200,
-          child: MetricLineGraph(
-            host: host,
-            slot: MetricSlot(key: 'cpu'),
-            smoothAnimation: true,
+          child: ScrollPhase(
+            sampleKey: host.latest.seq,
+            interval: host.interval,
+            builder: (_, phase) => MetricLineGraph(
+              host: host,
+              slot: MetricSlot(key: 'cpu'),
+              smoothAnimation: true,
+              phase: phase,
+            ),
           ),
         ),
       ),
@@ -203,7 +209,7 @@ void main() {
         .map((w) => w.painter)
         .whereType<SparklinePainter>()
         .first
-        .phase;
+        .phaseValue;
     await tester.pump(const Duration(milliseconds: 100));
     await tester.pump(const Duration(milliseconds: 150));
     expect(phase(), greaterThan(0));

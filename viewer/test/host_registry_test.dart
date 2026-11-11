@@ -46,7 +46,6 @@ void main() {
     expect(h.history['cpu']!.values, [10.0]);
     expect(h.history['gpu']!.values, [null]);
     expect(notifications, 1);
-    expect(reg.knownMetricKeys.toList(), ['cpu', 'gpu']);
   });
 
   test('live -> stale -> offline -> live', () {
@@ -119,11 +118,15 @@ void main() {
   });
 
   test('out-of-order and duplicate packets dropped; restart accepted', () {
-    reg.ingest(pkt(seq: 10, ts: 1000000));
+    reg.ingest(pkt(seq: 100, ts: 1000000));
     notifications = 0;
-    expect(reg.ingest(pkt(seq: 9, ts: 999000)), isFalse);
-    expect(reg.ingest(pkt(seq: 10, ts: 1000000)), isFalse, reason: 'duplicate');
-    expect(reg.hosts['a']!.latest.seq, 10);
+    expect(reg.ingest(pkt(seq: 99, ts: 999000)), isFalse);
+    expect(
+      reg.ingest(pkt(seq: 100, ts: 1000000)),
+      isFalse,
+      reason: 'duplicate',
+    );
+    expect(reg.hosts['a']!.latest.seq, 100);
     expect(reg.hosts['a']!.history['cpu']!.length, 1);
     expect(notifications, 0);
     expect(reg.droppedOutOfOrder, 2);
@@ -155,7 +158,7 @@ void main() {
     expect(reg.packetsPerSecond, 0);
   });
 
-  test('remove and removeOffline', () {
+  test('remove', () {
     reg.ingest(pkt(id: 'a'));
     reg.ingest(pkt(id: 'b'));
     notifications = 0;
@@ -164,9 +167,6 @@ void main() {
     expect(notifications, 1);
     reg.remove('nope');
     expect(notifications, 1);
-    reg.tick(t.add(const Duration(minutes: 1)));
-    expect(reg.removeOffline(), 1);
-    expect(reg.hosts, isEmpty);
   });
 
   test('host keyed by id survives rename', () {
@@ -210,6 +210,8 @@ void main() {
     };
     reg.ingest(pkt(seq: 1));
     final h = reg.hosts['a']!;
+    var hostNotifications = 0;
+    h.changes.addListener(() => hostNotifications++);
     expect(h.metricLastSeen, {'cpu': t, 'gpu': t}, reason: 'null value counts');
     expect(h.metricWindow, kMetricWindow);
     final gpuSeen = t;
@@ -221,13 +223,15 @@ void main() {
     expect(h.metricLastSeen['gpu'], gpuSeen);
     expect(h.recentMetricKeys(t), {'cpu', 'gpu'});
     reg.tick(t);
-    final before = notifications;
+    final before = hostNotifications;
+    final regBefore = notifications;
     t = t.add(const Duration(milliseconds: 1500));
     reg.tick(t);
     expect(h.recentMetricKeys(t), {'cpu'});
-    expect(notifications, before + 1, reason: 'recent set changed');
+    expect(hostNotifications, before + 1, reason: 'recent set changed');
+    expect(notifications, regBefore, reason: 'host-level change only');
     reg.tick(t);
-    expect(notifications, before + 1, reason: 'no change, no notify');
+    expect(hostNotifications, before + 1, reason: 'no change, no notify');
   });
 
   test(
@@ -241,4 +245,81 @@ void main() {
       expect(h.recentMetricKeys(t), {'cpu', 'gpu'});
     },
   );
+
+  test('large seq drop is a sender restart, accepted at once', () {
+    reg.ingest(pkt(seq: 5000, ts: 1000000));
+    // Same ts window, seq reset near zero: restart.
+    expect(reg.ingest(pkt(seq: 3, ts: 1000500)), isTrue);
+    expect(reg.hosts['a']!.latest.seq, 3);
+    reg.ingest(pkt(seq: 9000, ts: 1001000));
+    // Dropped by more than 1000: restart.
+    expect(reg.ingest(pkt(seq: 7000, ts: 1001500)), isTrue);
+    // Small step back, not near zero: reordered datagram.
+    expect(reg.ingest(pkt(seq: 6990, ts: 1001400)), isFalse);
+    expect(reg.droppedOutOfOrder, 1);
+    expect(HostRegistry.isSeqRestart(9, 50), isTrue);
+    expect(HostRegistry.isSeqRestart(10, 50), isFalse);
+    expect(HostRegistry.isSeqRestart(50, 50), isFalse);
+    expect(HostRegistry.isSeqRestart(11, 1011), isFalse);
+    expect(HostRegistry.isSeqRestart(1000, 2001), isTrue);
+  });
+
+  test('registry notifies on host set / status, host on every packet', () {
+    reg.ingest(pkt(id: 'a', seq: 1));
+    reg.ingest(pkt(id: 'b', seq: 1));
+    expect(notifications, 2, reason: 'two new hosts');
+    var aN = 0, bN = 0;
+    reg.hosts['a']!.changes.addListener(() => aN++);
+    reg.hosts['b']!.changes.addListener(() => bN++);
+    reg.ingest(pkt(id: 'a', seq: 2, ts: 1001000));
+    expect((aN, bN, notifications), (1, 0, 2));
+    // Rename is structural (order by name).
+    reg.ingest(pkt(id: 'a', host: 'zeta', seq: 3, ts: 1002000));
+    expect(notifications, 3);
+    // Stale, then a packet brings it back: status change notifies the registry.
+    t = t.add(const Duration(seconds: 4));
+    reg.tick(t);
+    expect(notifications, 4);
+    expect(aN, 3, reason: 'status change notifies the host too');
+    reg.ingest(pkt(id: 'a', host: 'zeta', seq: 4, ts: 1003000));
+    expect(notifications, 5);
+  });
+
+  test('metric keys not seen for 10 x metricWindow are pruned', () {
+    final cpuOnly = {
+      'cpu': const Metric(v: 10, unit: '%', label: 'CPU', max: 100),
+    };
+    reg.ingest(pkt(seq: 1));
+    final h = reg.hosts['a']!;
+    // 100 s of cpu-only packets (window 10 s -> prune after 100 s).
+    for (var i = 2; i <= 100; i++) {
+      t = t.add(const Duration(seconds: 1));
+      reg.ingest(pkt(seq: i, ts: 1000000 + i * 1000, metrics: cpuOnly));
+    }
+    reg.tick(t);
+    expect(h.history.keys, containsAll(['cpu', 'gpu']), reason: '99 s');
+    for (var i = 101; i <= 102; i++) {
+      t = t.add(const Duration(seconds: 1));
+      reg.ingest(pkt(seq: i, ts: 1000000 + i * 1000, metrics: cpuOnly));
+    }
+    reg.tick(t);
+    expect(h.history.keys, ['cpu']);
+    expect(h.metricLastSeen.keys, ['cpu']);
+  });
+
+  test('silent host keeps its keys; offline > 24 h is removed', () {
+    reg.ingest(pkt(id: 'a'));
+    reg.ingest(pkt(id: 'b'));
+    final h = reg.hosts['a']!;
+    t = t.add(const Duration(hours: 23));
+    reg.ingest(pkt(id: 'b', seq: 2, ts: 1001000));
+    reg.tick(t);
+    expect(h.status, HostStatus.offline);
+    expect(h.history.keys, ['cpu', 'gpu'], reason: 'measured from lastSeen');
+    notifications = 0;
+    t = t.add(const Duration(hours: 1, seconds: 31));
+    reg.tick(t);
+    expect(reg.hosts.keys, ['b'], reason: 'a offline for > 24 h');
+    expect(notifications, 1);
+  });
 }

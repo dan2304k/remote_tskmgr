@@ -104,6 +104,19 @@ impl Ctl {
         let _ = self.control.send(Control::Pause(p));
     }
 
+    /// `sender.log` next to the config file.
+    pub fn log_path(&self) -> PathBuf {
+        crate::logging::log_path(&self.path)
+    }
+
+    /// The directory holding the config file (and the log).
+    pub fn config_dir(&self) -> PathBuf {
+        match self.path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => PathBuf::from("."),
+        }
+    }
+
     pub fn request(&self, ev: GuiEvent) {
         let _ = self.events.send(ev);
     }
@@ -355,6 +368,16 @@ mod tests {
         let s = status.read();
         assert!(s.crashed && s.running);
         assert_eq!(s.last_error.as_deref(), Some(DAEMON_CRASHED));
+    }
+
+    #[test]
+    fn log_and_config_dir_follow_the_config_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ctl, _rx) = test_ctl(dir.path());
+        assert_eq!(ctl.config_dir(), dir.path());
+        assert_eq!(ctl.log_path(), dir.path().join("sender.log"));
+        ctl.path = PathBuf::from("sender.toml");
+        assert_eq!(ctl.config_dir(), PathBuf::from("."));
     }
 
     #[test]

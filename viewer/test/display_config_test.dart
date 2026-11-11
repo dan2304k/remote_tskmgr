@@ -44,10 +44,10 @@ void main() {
     final c = await DisplayConfig.load();
     var n = 0;
     c.addListener(() => n++);
-    c.ensureSlot('fan_rpm', isPercent: false);
-    c.ensureSlot('battery', isPercent: true);
-    c.ensureSlot('fan_rpm', isPercent: true);
-    c.ensureSlot('cpu', isPercent: true);
+    c.ensureSlot('fan_rpm');
+    c.ensureSlot('battery');
+    c.ensureSlot('fan_rpm');
+    c.ensureSlot('cpu');
     expect(n, 2);
     expect(c.slots.map((s) => s.key), [
       'cpu',
@@ -66,7 +66,7 @@ void main() {
   test('hidden slot is not re-added; visibleSlots', () async {
     final c = await DisplayConfig.load();
     c.setSlotVisible('gpu', false);
-    c.ensureSlot('gpu', isPercent: true);
+    c.ensureSlot('gpu');
     expect(c.slots, hasLength(4));
     expect(c.visibleSlots.map((s) => s.key), ['cpu', 'mem', 'disk']);
   });
@@ -269,9 +269,7 @@ void migrationTests() {
     expect(c.hostOrder, ['b', 'a']);
     c.setHostOrder(['b', 'a']);
     expect(n, 1, reason: 'unchanged order does not notify');
-    c.moveHost('a', 0);
-    expect(c.hostOrder, ['a', 'b']);
-    c.moveHost('z', 99);
+    c.setHostOrder(['a', 'b', 'z']);
     expect(c.hostOrder, ['a', 'b', 'z']);
     c.removeHostFromOrder('b');
     await settle();
@@ -301,7 +299,7 @@ void migrationTests() {
 
   test('new non-% slot (net MB/s) defaults to gauge', () async {
     final c = await DisplayConfig.load();
-    c.ensureSlot('net', isPercent: false);
+    c.ensureSlot('net');
     expect(c.slotFor('net')!.style, TileStyle.gauge);
     await settle();
     expect((await stored())[kSlotsMigratedV2Key], isTrue);
@@ -336,7 +334,7 @@ void migrationTests() {
 
   test('number chosen after migration is kept', () async {
     final c = await DisplayConfig.load();
-    c.ensureSlot('net', isPercent: false);
+    c.ensureSlot('net');
     c.setSlotStyle('net', TileStyle.number);
     await settle();
     final d = await DisplayConfig.load();

@@ -204,6 +204,75 @@ class Packet {
   }
 }
 
+/// 2^63: integer tokens at or beyond this magnitude (other than -2^63) do not fit a
+/// signed 64-bit integer.
+final BigInt _twoTo63 = BigInt.one << 63;
+
+/// Scans the number tokens of the JSON document [text] (assumed to be valid JSON) for
+/// values whose wire spelling the viewer cannot reproduce byte for byte, which would make
+/// an HMAC over the canonical body unverifiable (see PROTOCOL.md "Auth"):
+/// * `-0` as an integer token (decodes to 0, re-serialised as `0`);
+/// * integer tokens outside the signed 64-bit range (decode to a rounded double).
+///
+/// Non-finite values (`1e400`) are rejected for every packet by [Packet.fromJson].
+/// Returns a description of the first offending token, or null when there is none.
+String? authUnsafeNumber(String text) {
+  final n = text.length;
+  var i = 0;
+  while (i < n) {
+    final c = text.codeUnitAt(i);
+    if (c == 0x22) {
+      // Skip a string, honouring backslash escapes.
+      i++;
+      while (i < n) {
+        final d = text.codeUnitAt(i);
+        if (d == 0x5C) {
+          i += 2;
+        } else if (d == 0x22) {
+          i++;
+          break;
+        } else {
+          i++;
+        }
+      }
+      continue;
+    }
+    if (c == 0x2D || (c >= 0x30 && c <= 0x39)) {
+      final start = i;
+      i++;
+      var integral = true;
+      while (i < n) {
+        final d = text.codeUnitAt(i);
+        if (d >= 0x30 && d <= 0x39) {
+          i++;
+        } else if (d == 0x2E ||
+            d == 0x65 ||
+            d == 0x45 ||
+            d == 0x2B ||
+            d == 0x2D) {
+          integral = false;
+          i++;
+        } else {
+          break;
+        }
+      }
+      if (!integral) continue;
+      final token = text.substring(start, i);
+      if (token == '-0') return 'integer -0';
+      final digits = token.startsWith('-') ? token.length - 1 : token.length;
+      if (digits >= 19) {
+        final v = BigInt.parse(token);
+        if (v >= _twoTo63 || v < -_twoTo63) {
+          return 'integer $token outside the 64-bit range';
+        }
+      }
+      continue;
+    }
+    i++;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------------------
 // Parsing helpers
 

@@ -1,10 +1,13 @@
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/widgets.dart';
 
-/// Settled when within this fraction of the value range of the target.
-const double kFollowerSettleFraction = 0.0005;
+/// Settled when within this fraction of the value range of the target: about display
+/// precision (under a pixel of a ~120 dp gauge arc or a bar, under the last shown digit
+/// of a `%` value), so the ticker stops instead of chasing invisible differences.
+const double kFollowerSettleFraction = 0.004;
 
 /// One frame of critically damped exponential smoothing: moves [current] toward
 /// [target] by 1 - exp(-dt / tau). Never overshoots; tau <= 0 snaps.
@@ -123,9 +126,65 @@ class ValueFollowerState extends State<ValueFollower>
   Widget build(BuildContext context) => widget.builder(context, _shown);
 }
 
-/// Drives a 0..1 "scroll phase" for line graphs: time since [sampleKey] last changed,
-/// as a fraction of [interval]. Ticks only until the phase reaches 1 (a late packet),
-/// and not at all when [enabled] is false (phase stays 0).
+/// A 0..1 "scroll phase" for line graphs: time since the last sample, as a fraction of
+/// the sender interval. One driver serves every graph of a card; painters take it as
+/// their `repaint` listenable, so a tick repaints the plots without rebuilding widgets.
+/// Ticks only until the phase reaches 1 (a late packet).
+class ScrollPhaseDriver extends ChangeNotifier
+    implements ValueListenable<double> {
+  ScrollPhaseDriver(TickerProvider vsync) {
+    _ticker = vsync.createTicker(_onTick);
+  }
+
+  late final Ticker _ticker;
+  Duration _interval = const Duration(seconds: 1);
+  double _value = 0;
+
+  @override
+  double get value => _value;
+
+  /// Whether the driver is ticking (for tests).
+  bool get isActive => _ticker.isActive;
+
+  /// A new sample arrived: restart the phase at 0 and tick toward 1 over [interval].
+  void restart(Duration interval) {
+    _interval = interval;
+    if (_ticker.isActive) _ticker.stop();
+    _set(0);
+    _ticker.start();
+  }
+
+  /// Stop and hold the phase at 0 (smooth animation off).
+  void reset() {
+    if (_ticker.isActive) _ticker.stop();
+    _set(0);
+  }
+
+  void _onTick(Duration elapsed) {
+    final us = _interval.inMicroseconds;
+    var p = us <= 0 ? 1.0 : elapsed.inMicroseconds / us;
+    if (p >= 1) {
+      p = 1;
+      _ticker.stop();
+    }
+    _set(p);
+  }
+
+  void _set(double v) {
+    if (v == _value) return;
+    _value = v;
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _ticker.dispose();
+    super.dispose();
+  }
+}
+
+/// Owns a [ScrollPhaseDriver] restarted whenever [sampleKey] changes (or on re-enable).
+/// [builder] runs on widget rebuilds only, not per tick: pass the phase on to painters.
 class ScrollPhase extends StatefulWidget {
   const ScrollPhase({
     super.key,
@@ -138,7 +197,8 @@ class ScrollPhase extends StatefulWidget {
   final Object? sampleKey;
   final Duration interval;
   final bool enabled;
-  final Widget Function(BuildContext context, double phase) builder;
+  final Widget Function(BuildContext context, ValueListenable<double> phase)
+  builder;
 
   @override
   State<ScrollPhase> createState() => _ScrollPhaseState();
@@ -146,47 +206,33 @@ class ScrollPhase extends StatefulWidget {
 
 class _ScrollPhaseState extends State<ScrollPhase>
     with SingleTickerProviderStateMixin {
-  late final Ticker _ticker = createTicker(_onTick);
-  double _phase = 0;
+  late final ScrollPhaseDriver _driver = ScrollPhaseDriver(this);
 
   @override
   void initState() {
     super.initState();
-    if (widget.enabled) _ticker.start();
+    if (widget.enabled) _driver.restart(widget.interval);
   }
 
   @override
   void didUpdateWidget(ScrollPhase oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (!widget.enabled) {
-      _phase = 0;
-      if (_ticker.isActive) _ticker.stop();
+      _driver.reset();
       return;
     }
     // Restart only on a new sample (or re-enable); other rebuilds must not reset it.
     if (widget.sampleKey != oldWidget.sampleKey || !oldWidget.enabled) {
-      _phase = 0;
-      if (_ticker.isActive) _ticker.stop();
-      _ticker.start(); // elapsed restarts at 0 = this sample's arrival
+      _driver.restart(widget.interval);
     }
-  }
-
-  void _onTick(Duration elapsed) {
-    final ms = widget.interval.inMicroseconds;
-    var p = ms <= 0 ? 1.0 : elapsed.inMicroseconds / ms;
-    if (p >= 1) {
-      p = 1;
-      _ticker.stop();
-    }
-    setState(() => _phase = p);
   }
 
   @override
   void dispose() {
-    _ticker.dispose();
+    _driver.dispose();
     super.dispose();
   }
 
   @override
-  Widget build(BuildContext context) => widget.builder(context, _phase);
+  Widget build(BuildContext context) => widget.builder(context, _driver);
 }

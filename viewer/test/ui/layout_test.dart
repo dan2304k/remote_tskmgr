@@ -523,8 +523,8 @@ void main() {
               ),
             ],
           );
-          h.config.ensureSlot('net', isPercent: false);
-          h.config.ensureSlot('uptime', isPercent: false);
+          h.config.ensureSlot('net');
+          h.config.ensureSlot('uptime');
           h.config.cardLayout = layout;
           for (final d in GridDensity.values) {
             h.config.density = d;

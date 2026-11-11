@@ -133,12 +133,17 @@ pub struct Changes {
 pub fn diff(old: &Config, new: &Config) -> Changes {
     let cc = |c: &Config| {
         let x = c.to_collector_config();
-        (x.enabled, x.gpu_backend, x.gpu_adapter, x.disk_include)
+        (
+            x.enabled,
+            x.gpu_backend,
+            x.gpu_adapter,
+            x.disk_include,
+            x.net_skip_prefixes,
+        )
     };
     Changes {
         interval: old.general.interval_ms != new.general.interval_ms,
-        // Compared without DNS: a host name that resolves differently is picked up by
-        // `State::apply` re-resolving whenever a target was skipped.
+        // Compared as written: host names are resolved (and re-resolved) by rtm-net itself.
         targets: old.network != new.network && old.target_plan().ok() != new.target_plan().ok(),
         collectors: cc(old) != cc(new),
         meta: Meta::from_config(old) != Meta::from_config(new),
@@ -164,13 +169,9 @@ fn make_sender(targets: &[Target]) -> Option<rtm_net::Sender> {
     }
 }
 
-/// `to_targets`, logging each skipped host name; the flag says whether any was skipped.
-fn resolve(cfg: &Config) -> anyhow::Result<(Vec<Target>, bool)> {
-    let r = cfg.resolve_targets()?;
-    for (spec, e) in &r.unresolved {
-        tracing::warn!("target {spec} skipped ({e}); will retry on the next config reload");
-    }
-    Ok((r.targets, !r.unresolved.is_empty()))
+/// The configured targets. No DNS here: host-name targets are resolved by rtm-net.
+fn targets_of(cfg: &Config) -> anyhow::Result<Vec<Target>> {
+    Ok(cfg.to_targets()?)
 }
 
 fn prime(collectors: &mut Collectors, nominal: Duration) {
@@ -200,8 +201,6 @@ struct State {
     collector_cfg: CollectorConfig,
     collectors: Collectors,
     targets: Vec<Target>,
-    /// Some unicast host name did not resolve; retried on the next reload.
-    unresolved: bool,
     sender: Option<rtm_net::Sender>,
     last_sender_attempt: Instant,
     seq: u64,
@@ -209,7 +208,7 @@ struct State {
     warned_size: bool,
     send_ok: bool,
     /// While paused the loop keeps ticking and sampling (so counter baselines stay fresh and
-    /// the first packet after resuming has correct rates) but sends nothing.
+    /// the first packet after resuming has correct rates) but builds and sends nothing.
     paused: bool,
     last_bytes: Option<usize>,
     last_error: Option<String>,
@@ -219,7 +218,7 @@ struct State {
 
 impl State {
     fn new(cfg: Config) -> anyhow::Result<Self> {
-        let (targets, unresolved) = resolve(&cfg)?;
+        let targets = targets_of(&cfg)?;
         let collector_cfg = cfg.to_collector_config();
         let mut collectors = Collectors::new(&collector_cfg);
         tracing::info!(metrics = ?collectors.ids(), "collectors ready");
@@ -229,7 +228,6 @@ impl State {
             sender: make_sender(&targets),
             last_sender_attempt: Instant::now(),
             targets,
-            unresolved,
             collector_cfg,
             collectors,
             cfg,
@@ -268,13 +266,10 @@ impl State {
         };
     }
 
-    /// Returns true when the tick schedule must be re-anchored.
-    fn apply(&mut self, new: Config) -> bool {
-        let mut ch = diff(&self.cfg, &new);
-        if self.unresolved && !ch.targets {
-            tracing::info!("retrying host names that did not resolve");
-            ch.targets = true;
-        }
+    /// Returns true when the tick schedule must be re-anchored. If the new targets cannot be
+    /// built, the old network settings stay current (so the same reload later retries them).
+    fn apply(&mut self, mut new: Config) -> bool {
+        let ch = diff(&self.cfg, &new);
         if ch == Changes::default() {
             tracing::debug!("config file changed but nothing relevant differs");
             self.cfg = new;
@@ -282,15 +277,17 @@ impl State {
         }
         tracing::info!(?ch, "applying reloaded config");
         if ch.targets {
-            match resolve(&new) {
-                Ok((t, unresolved)) => {
+            match targets_of(&new) {
+                Ok(t) => {
                     self.sender = None; // drop old sockets / TCP threads first
                     self.targets = t;
-                    self.unresolved = unresolved;
                     self.sender = make_sender(&self.targets);
                     self.last_sender_attempt = Instant::now();
                 }
-                Err(e) => tracing::error!("targets invalid, keeping old ones: {e}"),
+                Err(e) => {
+                    tracing::error!("targets invalid, keeping the old network settings: {e}");
+                    new.network = self.cfg.network.clone();
+                }
             }
         }
         if ch.collectors {
@@ -310,11 +307,13 @@ impl State {
         let dt = now.duration_since(self.last_sample);
         self.last_sample = now;
         let metrics = self.collectors.sample_all(dt);
-        let packet = build_packet(&self.meta, self.seq, rtm_protocol::now_ms(), metrics);
-        self.seq += 1;
         if self.paused {
+            // Sampled only to keep the rate baselines fresh. No packet is built, so `seq` does
+            // not advance and the first packet after resuming follows the last one sent.
             return;
         }
+        let packet = build_packet(&self.meta, self.seq, rtm_protocol::now_ms(), metrics);
+        self.seq += 1;
 
         if self.sender.is_none()
             && !self.targets.is_empty()
@@ -646,8 +645,73 @@ mod tests {
         );
 
         let mut b = a.clone();
+        b.network.skip_interface_prefixes.push("tailscale".into());
+        let d = diff(&a, &b);
+        assert!(d.targets && d.collectors, "{d:?}");
+
+        let mut b = a.clone();
         b.gui.autostart = true;
         assert_eq!(diff(&a, &b), Changes::default());
+    }
+
+    /// Valid, sends nowhere (no broadcast, no unicast), one cheap metric.
+    fn quiet_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.general.id = "t".into();
+        cfg.general.host_name = "quiet".into();
+        cfg.network.udp_broadcast = false;
+        cfg.metrics.enabled = vec!["mem".into()];
+        cfg.validate().unwrap();
+        cfg
+    }
+
+    #[test]
+    fn seq_does_not_advance_while_paused() {
+        let mut st = State::new(quiet_cfg()).unwrap();
+        assert!(st.targets.is_empty() && st.sender.is_none());
+        st.tick();
+        st.tick();
+        assert_eq!(st.seq, 2);
+        st.paused = true;
+        st.tick();
+        st.tick();
+        assert_eq!(st.seq, 2, "paused ticks build no packet");
+        st.paused = false;
+        st.tick();
+        assert_eq!(st.seq, 3);
+    }
+
+    #[test]
+    fn rejected_targets_keep_the_old_network_config() {
+        let mut st = State::new(quiet_cfg()).unwrap();
+        let mut bad = quiet_cfg();
+        bad.network.tcp_unicast = vec!["no pe".into()];
+        bad.network.shared_secret = "new-secret".into();
+        bad.general.host_name = "renamed".into();
+        assert!(bad.target_plan().is_err());
+
+        st.apply(bad.clone());
+        assert_eq!(
+            st.cfg.network,
+            quiet_cfg().network,
+            "rejected network not stored"
+        );
+        assert!(st.targets.is_empty());
+        assert_eq!(st.meta.host, "renamed", "the rest of the reload applies");
+        assert_eq!(
+            st.meta.secret, None,
+            "secret is part of the kept network settings"
+        );
+        // The same reload again is still a target change, so it is retried, not ignored.
+        assert!(diff(&st.cfg, &bad).targets);
+        st.apply(bad);
+        assert_eq!(st.cfg.network, quiet_cfg().network);
+
+        // A good reload afterwards applies normally.
+        let mut good = quiet_cfg();
+        good.network.udp_port = 48123;
+        st.apply(good.clone());
+        assert_eq!(st.cfg.network, good.network);
     }
 
     #[test]
@@ -693,16 +757,28 @@ mod tests {
         }
 
         tx.send(Control::Pause(true)).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        let until = Instant::now() + Duration::from_secs(10);
+        while !status.read().paused {
+            assert!(Instant::now() < until, "pause not applied");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         while rx_sock.recv(&mut buf).is_ok() {} // drain anything in flight
-        let sent_at_pause = status.read().sent;
+        let (sent_at_pause, seq_at_pause) = (status.read().sent, status.read().seq);
         assert_eq!(count(700, &mut buf), 0, "nothing sent while paused");
         assert!(status.read().paused);
         assert_eq!(status.read().sent, sent_at_pause);
-        assert!(status.read().seq > 0, "still sampling");
+        assert_eq!(status.read().seq, seq_at_pause, "seq frozen while paused");
 
         tx.send(Control::Pause(false)).unwrap();
-        assert!(count(700, &mut buf) >= 1, "resumes");
+        let until = Instant::now() + Duration::from_secs(10);
+        let n = loop {
+            assert!(Instant::now() < until, "no packet after resuming");
+            if let Ok(n) = rx_sock.recv(&mut buf) {
+                break n;
+            }
+        };
+        let p = Packet::from_json(std::str::from_utf8(&buf[..n]).unwrap()).unwrap();
+        assert_eq!(p.seq, seq_at_pause + 1, "no gap in seq after resuming");
         tx.send(Control::Shutdown).unwrap();
         h.join().unwrap().unwrap();
     }

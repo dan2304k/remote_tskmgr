@@ -12,38 +12,54 @@ jobs:
         os: [ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
     defaults: { run: { working-directory: sender, shell: bash } }
+    env:
+      # build.rs: fail instead of shipping a Windows exe without version info / icon.
+      RTM_REQUIRE_WINRES: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: sender }
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxkbcommon-dev
       # Linux: a headless binary (no GTK needed, for servers) and a tray/GUI binary.
       - if: runner.os == 'Linux'
         run: |
+          mkdir -p ../out
           cargo build --release -p rtm-sender
-          cp target/release/rtm-sender ../rtm-sender-linux-x86_64
+          cp target/release/rtm-sender ../out/rtm-sender-linux-x86_64
           cargo build --release -p rtm-sender --features gui
-          cp target/release/rtm-sender ../rtm-sender-gui-linux-x86_64
-          echo "ASSETS<<EOF" >> "$GITHUB_ENV"
-          echo "rtm-sender-linux-x86_64" >> "$GITHUB_ENV"
-          echo "rtm-sender-gui-linux-x86_64" >> "$GITHUB_ENV"
-          echo "EOF" >> "$GITHUB_ENV"
-      # Windows: the GUI build (needs no extra libraries), bare and as a zip with the installer.
+          cp target/release/rtm-sender ../out/rtm-sender-gui-linux-x86_64
+      # Windows: the GUI build (needs no extra libraries): bare, as a zip with install.bat, and
+      # as an Inno Setup installer (rtm-sender.iss reads dist\windows-x86_64\rtm-sender.exe).
       - if: runner.os == 'Windows'
         run: |
+          mkdir -p ../out ../dist/windows-x86_64 ../zip/rtm-sender
           cargo build --release -p rtm-sender --features gui
-          cp target/release/rtm-sender.exe ../rtm-sender-windows-x86_64.exe
-          mkdir -p ../zip/rtm-sender
+          cp target/release/rtm-sender.exe ../out/rtm-sender-windows-x86_64.exe
+          cp target/release/rtm-sender.exe ../dist/windows-x86_64/
           cp target/release/rtm-sender.exe ../packaging/windows/install.bat ../packaging/windows/uninstall.bat ../LICENSE ../zip/rtm-sender/
           cp ../packaging/README.md ../zip/rtm-sender/INSTALL.md
-          (cd ../zip && 7z a -tzip ../rtm-sender-windows-x86_64.zip rtm-sender)
-          echo "ASSETS<<EOF" >> "$GITHUB_ENV"
-          echo "rtm-sender-windows-x86_64.exe" >> "$GITHUB_ENV"
-          echo "rtm-sender-windows-x86_64.zip" >> "$GITHUB_ENV"
-          echo "EOF" >> "$GITHUB_ENV"
-      - uses: softprops/action-gh-release@v2
+          (cd ../zip && 7z a -tzip ../out/rtm-sender-windows-x86_64.zip rtm-sender)
+      # pwsh, not bash: Git Bash would rewrite the /DAppVersion argument as a path.
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: .
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          $ver = "${env:GITHUB_REF_NAME}" -replace '^v', ''
+          & $iscc "/DAppVersion=$ver" packaging\windows\rtm-sender.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item dist\windows-x86_64\rtm-sender-setup.exe out\rtm-sender-setup.exe
+      - uses: actions/upload-artifact@v4
         with:
-          files: ${{ env.ASSETS }}
+          name: sender-${{ runner.os }}
+          path: out/*
+          if-no-files-found: error
   viewer:
     runs-on: ubuntu-24.04
     defaults: { run: { working-directory: viewer } }
@@ -52,10 +68,27 @@ jobs:
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '21' }
       - uses: subosito/flutter-action@v2
-        with: { channel: stable, flutter-version: '3.47.9' }
+        with: { channel: stable, flutter-version: '3.47.9', cache: true }
       - run: flutter pub get
       - run: flutter build apk --release
-      - run: cp build/app/outputs/flutter-apk/app-release.apk ../rtm-viewer.apk
+      - run: mkdir -p ../out && cp build/app/outputs/flutter-apk/app-release.apk ../out/rtm-viewer.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viewer
+          path: out/rtm-viewer.apk
+          if-no-files-found: error
+  # One release with every asset plus SHA256SUMS, published only if all builds succeeded.
+  publish:
+    needs: [sender, viewer]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: assets, merge-multiple: true }
+      - run: |
+          cd assets
+          sha256sum -- * > ../SHA256SUMS
+          mv ../SHA256SUMS .
+          cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          files: rtm-viewer.apk
+          files: assets/*

@@ -3,7 +3,7 @@
 //! Unknown keys are ignored (serde default), missing keys take defaults.
 
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 /// Smallest accepted `general.interval_ms`.
@@ -231,6 +231,20 @@ impl Config {
                 errs.push("metrics.enabled contains an empty key".into());
             }
         }
+        if let Err(e) = check_gpu_adapter(&self.metrics.gpu_adapter) {
+            errs.push(format!(
+                "metrics.gpu_adapter = '{}': {e}",
+                self.metrics.gpu_adapter
+            ));
+        }
+        if self
+            .metrics
+            .disk_include
+            .iter()
+            .any(|d| d.trim().is_empty())
+        {
+            errs.push("metrics.disk_include contains an empty entry".into());
+        }
         if errs.is_empty() {
             Ok(())
         } else {
@@ -268,6 +282,7 @@ impl Config {
             gpu_backend: self.metrics.gpu_backend.parse().unwrap_or_default(),
             gpu_adapter: self.metrics.gpu_adapter.trim().to_string(),
             disk_include: self.metrics.disk_include.clone(),
+            net_skip_prefixes: self.network.skip_interface_prefixes.clone(),
         }
     }
 
@@ -313,8 +328,8 @@ impl Config {
     }
 
     /// Broadcast (if enabled) first, then UDP unicast, then TCP unicast, in file order.
-    /// Host names are resolved here; one that does not resolve is logged and skipped (see
-    /// `resolve_targets` to learn which were skipped).
+    /// Never blocks: host names become `Target::UdpHost` / `Target::TcpHost` and are resolved
+    /// by `rtm_net` off the sample thread (TCP before every connect, UDP every 60 s).
     pub fn to_targets(&self) -> Result<Vec<rtm_net::Target>, ConfigError> {
         let r = self.resolve_targets()?;
         for (spec, e) in &r.unresolved {
@@ -323,19 +338,15 @@ impl Config {
         Ok(r.targets)
     }
 
-    /// Like `to_targets`, but reports skipped (unresolvable) targets instead of logging them.
+    /// Same as `to_targets`. Kept for source compatibility: since 1.0.1 names are resolved
+    /// by `rtm_net` in the background, so `unresolved` is always empty.
     pub fn resolve_targets(&self) -> Result<ResolvedTargets, ConfigError> {
         let plan = self.target_plan()?;
         let mut out = ResolvedTargets::default();
         out.targets.extend(plan.broadcast);
         for (specs, tcp) in [(plan.udp, false), (plan.tcp, true)] {
-            for spec in specs {
-                match spec.resolve() {
-                    Ok(a) if tcp => out.targets.push(rtm_net::Target::TcpUnicast(a)),
-                    Ok(a) => out.targets.push(rtm_net::Target::UdpUnicast(a)),
-                    Err(e) => out.unresolved.push((spec, e)),
-                }
-            }
+            out.targets
+                .extend(specs.into_iter().map(|spec| spec.to_target(tcp)));
         }
         Ok(out)
     }
@@ -353,7 +364,7 @@ pub struct TargetPlan {
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedTargets {
     pub targets: Vec<rtm_net::Target>,
-    /// Targets whose host name did not resolve, with the reason.
+    /// Always empty since 1.0.1 (names are resolved by `rtm_net`, see `Config::to_targets`).
     pub unresolved: Vec<(TargetSpec, String)>,
 }
 
@@ -374,24 +385,44 @@ impl std::fmt::Display for TargetSpec {
 }
 
 impl TargetSpec {
-    /// Resolve a host name (first IPv4 address preferred). Addresses are returned as is.
+    /// Resolve a host name now (first IPv4 address preferred); blocking, so not for the
+    /// sample thread. Addresses are returned as is.
     pub fn resolve(&self) -> Result<SocketAddr, String> {
         match self {
             Self::Addr(a) => Ok(*a),
-            Self::Host(h, p) => {
-                let addrs: Vec<SocketAddr> = (h.as_str(), *p)
-                    .to_socket_addrs()
-                    .map_err(|e| format!("cannot resolve '{h}': {e}"))?
-                    .collect();
-                addrs
-                    .iter()
-                    .find(|a| a.is_ipv4())
-                    .or_else(|| addrs.first())
-                    .copied()
-                    .ok_or_else(|| format!("'{h}' has no addresses"))
-            }
+            Self::Host(h, p) => rtm_net::resolve_host(h, *p),
         }
     }
+
+    /// The `rtm_net` target, without any lookup.
+    pub fn to_target(&self, tcp: bool) -> rtm_net::Target {
+        match (self, tcp) {
+            (Self::Addr(a), false) => rtm_net::Target::UdpUnicast(*a),
+            (Self::Addr(a), true) => rtm_net::Target::TcpUnicast(*a),
+            (Self::Host(h, p), false) => rtm_net::Target::UdpHost {
+                host: h.clone(),
+                port: *p,
+            },
+            (Self::Host(h, p), true) => rtm_net::Target::TcpHost {
+                host: h.clone(),
+                port: *p,
+            },
+        }
+    }
+}
+
+/// `metrics.gpu_adapter`: `auto`, `#N`, or a non-empty part of an adapter name / id.
+pub fn check_gpu_adapter(s: &str) -> Result<(), String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("empty (use \"auto\", \"#N\" or part of the adapter name)".into());
+    }
+    if let Some(n) = t.strip_prefix('#') {
+        if n.trim().parse::<usize>().is_err() {
+            return Err("expected #N with N a number, e.g. #1".into());
+        }
+    }
+    Ok(())
 }
 
 /// Parse a unicast target without resolving names. Accepts `ip`, `ip:port`, `[v6]`,

@@ -11,6 +11,7 @@ fn cfg(ids: &[&str]) -> CollectorConfig {
         gpu_backend: GpuBackend::Auto,
         gpu_adapter: "auto".into(),
         disk_include: Vec::new(),
+        ..CollectorConfig::default()
     }
 }
 

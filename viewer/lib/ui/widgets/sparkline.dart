@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../theme.dart';
@@ -28,9 +29,11 @@ class Sparkline extends StatelessWidget {
     this.strokeWidth = 1.6,
     this.peak,
     this.unit,
-    this.phase = 0,
+    this.phase,
   });
 
+  /// Samples, oldest first. Pass a [List] that is reused across rebuilds while the data
+  /// is unchanged and the painter skips repainting.
   final Iterable<double?> values;
   final double min;
   final double? max;
@@ -47,8 +50,9 @@ class Sparkline extends StatelessWidget {
   final String? unit;
 
   /// 0..1 fraction of one sample slot to scroll left (time since the newest sample
-  /// over the interval), so the line slides continuously between packets.
-  final double phase;
+  /// over the interval), so the line slides continuously between packets. Listened to
+  /// by the painter directly (repaint only, no rebuild); null = no scrolling.
+  final ValueListenable<double>? phase;
 
   @override
   Widget build(BuildContext context) {
@@ -57,27 +61,32 @@ class Sparkline extends StatelessWidget {
     final dark = Theme.of(context).brightness == Brightness.dark;
     final c = color ?? rc.accent;
     final u = unit;
-    return SizedBox(
-      height: height,
-      width: double.infinity,
-      child: CustomPaint(
-        painter: SparklinePainter(
-          values: values.toList(growable: false),
-          min: min,
-          max: max,
-          capacity: capacity,
-          color: c,
-          strokeWidth: strokeWidth,
-          peak: peak,
-          peakColor: rc.muted,
-          plotFill: scheme.surfaceContainerHighest.withValues(
-            alpha: dark ? 0.55 : 0.7,
+    final vs = values;
+    // Own layer: a gliding gauge or value text next to it does not repaint the plot,
+    // and the scroll phase repaints only this.
+    return RepaintBoundary(
+      child: SizedBox(
+        height: height,
+        width: double.infinity,
+        child: CustomPaint(
+          painter: SparklinePainter(
+            values: vs is List<double?> ? vs : vs.toList(growable: false),
+            min: min,
+            max: max,
+            capacity: capacity,
+            color: c,
+            strokeWidth: strokeWidth,
+            peak: peak,
+            peakColor: rc.muted,
+            plotFill: scheme.surfaceContainerHighest.withValues(
+              alpha: dark ? 0.55 : 0.7,
+            ),
+            plotBorder: scheme.outline.withValues(alpha: dark ? 0.35 : 0.3),
+            gridColor: scheme.outline.withValues(alpha: dark ? 0.22 : 0.2),
+            boundedTop: u == '%' && max != null,
+            fillColor: areaFillFor(c, dark: dark),
+            phase: phase,
           ),
-          plotBorder: scheme.outline.withValues(alpha: dark ? 0.35 : 0.3),
-          gridColor: scheme.outline.withValues(alpha: dark ? 0.22 : 0.2),
-          boundedTop: u == '%' && max != null,
-          fillColor: areaFillFor(c, dark: dark),
-          phase: phase,
         ),
       ),
     );
@@ -107,8 +116,8 @@ class SparklinePainter extends CustomPainter {
     this.gridColor,
     this.boundedTop = false,
     this.fillColor,
-    this.phase = 0,
-  });
+    this.phase,
+  }) : super(repaint: phase);
 
   final List<double?> values;
   final double min;
@@ -130,8 +139,12 @@ class SparklinePainter extends CustomPainter {
   /// Area fill under the line; null = [color] at low alpha.
   final Color? fillColor;
 
-  /// Scroll offset in sample slots (0..1); see [Sparkline.phase].
-  final double phase;
+  /// Scroll offset in sample slots (0..1); see [Sparkline.phase]. Also the painter's
+  /// repaint listenable.
+  final ValueListenable<double>? phase;
+
+  /// Current [phase], 0 when none.
+  double get phaseValue => phase?.value ?? 0;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -199,10 +212,11 @@ class SparklinePainter extends CustomPainter {
   void _paintLine(Canvas canvas, Size size, double Function(double) y) {
     final slots = math.max(capacity ?? values.length, values.length);
     final dx = slots <= 1 ? 0.0 : size.width / (slots - 1);
+    final ph = phaseValue;
     final x0 =
         size.width -
         dx * (values.length - 1) -
-        dx * (phase.isFinite ? phase.clamp(0.0, 1.0) : 0.0);
+        dx * (ph.isFinite ? ph.clamp(0.0, 1.0) : 0.0);
     final line = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = strokeWidth
@@ -259,5 +273,19 @@ class SparklinePainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(SparklinePainter old) => true;
+  bool shouldRepaint(SparklinePainter old) =>
+      !(identical(values, old.values) || listEquals(values, old.values)) ||
+      min != old.min ||
+      max != old.max ||
+      capacity != old.capacity ||
+      color != old.color ||
+      strokeWidth != old.strokeWidth ||
+      peak != old.peak ||
+      peakColor != old.peakColor ||
+      plotFill != old.plotFill ||
+      plotBorder != old.plotBorder ||
+      gridColor != old.gridColor ||
+      boundedTop != old.boundedTop ||
+      fillColor != old.fillColor ||
+      phase != old.phase;
 }
