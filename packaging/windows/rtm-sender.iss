@@ -1,12 +1,33 @@
 ; rtm-sender.iss - Inno Setup 6 script producing rtm-sender-setup.exe
 ; Compile on Windows with Inno Setup (https://jrsoftware.org/isinfo.php):
-;   iscc packaging\windows\rtm-sender.iss
-; after sender\build.bat has produced dist\windows-x86_64\rtm-sender.exe.
+;   iscc /DAppVersion=1.2.3 packaging\windows\rtm-sender.iss
+; after sender\build.bat has produced dist\windows-x86_64\rtm-sender.exe. Without
+; /DAppVersion the version is read from [workspace.package] in sender\Cargo.toml (the exe
+; has no version resource, so GetVersionNumbersString cannot be used).
 
 #define AppName "rtm-sender"
-#define AppVersion GetVersionNumbersString("..\..\dist\windows-x86_64\rtm-sender.exe")
-#if AppVersion == ""
-  #define AppVersion "1.0.0"
+
+#ifndef AppVersion
+  #define CargoToml SourcePath + "..\..\sender\Cargo.toml"
+  #define AppVersion ""
+  #define FileHandle
+  #define FileLine
+  #define AfterQuote
+  ; Takes the first line of the form version = "x.y.z" (rust-version etc. do not match).
+  #sub ReadVersionLine
+    #define FileLine = Trim(FileRead(FileHandle))
+    #if Copy(FileLine, 1, 7) == "version" && Copy(StringChange(Copy(FileLine, 8), " ", ""), 1, 1) == "=" && Pos('"', FileLine) > 0
+      #define AfterQuote = Copy(FileLine, Pos('"', FileLine) + 1)
+      #define AppVersion = Copy(AfterQuote, 1, Pos('"', AfterQuote) - 1)
+    #endif
+  #endsub
+  #for {FileHandle = FileOpen(CargoToml); FileHandle && !FileEof(FileHandle) && AppVersion == ""; ""} ReadVersionLine
+  #if FileHandle
+    #expr FileClose(FileHandle)
+  #endif
+  #if AppVersion == ""
+    #error Could not read the version from sender\Cargo.toml; pass /DAppVersion=x.y.z
+  #endif
 #endif
 
 [Setup]
@@ -43,11 +64,29 @@ Name: "{group}\Uninstall rtm-sender"; Filename: "{uninstallexe}"
 Name: "autostart"; Description: "Start rtm-sender when I log in"; GroupDescription: "Startup:"; Flags: checkedonce
 
 [Registry]
-; Same HKCU Run value the tray's "Start with login" setting manages.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "rtm-sender"; ValueData: """{app}\rtm-sender.exe"""; Flags: uninsdeletevalue; Tasks: autostart
+; HKA = HKCU for a per-user install (the value the tray's "Start at login" checkbox manages),
+; HKLM for an all-users install (every user's login starts the sender).
+Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "rtm-sender"; ValueData: """{app}\rtm-sender.exe"""; Flags: uninsdeletevalue; Tasks: autostart
 
 [Run]
 Filename: "{app}\rtm-sender.exe"; Description: "Start rtm-sender now"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
 Filename: "taskkill"; Parameters: "/IM rtm-sender.exe /F"; Flags: runhidden; RunOnceId: "killsender"
+
+[Code]
+const
+  RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+
+{ The tray's "Start at login" checkbox writes HKCU\...\Run\rtm-sender on its own, so the
+  [Registry] uninsdeletevalue entry (only present when the task was ticked) is not enough:
+  remove the value unconditionally. }
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    RegDeleteValue(HKEY_CURRENT_USER, RunKey, 'rtm-sender');
+    if IsAdminInstallMode then
+      RegDeleteValue(HKEY_LOCAL_MACHINE, RunKey, 'rtm-sender');
+  end;
+end;

@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 /// Smallest accepted `general.interval_ms`.
 pub const MIN_INTERVAL_MS: u64 = 100;
+/// Largest accepted `general.interval_ms` (one hour).
+pub const MAX_INTERVAL_MS: u64 = 3_600_000;
 /// Accepted values of `metrics.gpu_backend`.
 pub const GPU_BACKENDS: &[&str] = &["auto", "nvml", "amdgpu", "intel", "pdh", "none"];
 
@@ -151,7 +153,8 @@ impl Config {
     }
 
     /// Load, or write defaults (with comments) and return them. Resolves `id = "auto"` (or an
-    /// empty id) to a UUID v4 and persists it back to the file, keeping the user's comments.
+    /// empty or missing id) to a UUID v4 and persists it back to the file, keeping the user's
+    /// comments: the `id` line is replaced, or inserted under `[general]` when there is none.
     pub fn load_or_create(path: &Path) -> Result<Config, ConfigError> {
         if !path.exists() {
             let mut cfg = Config::default();
@@ -164,7 +167,12 @@ impl Config {
         let mut cfg = Self::from_toml(&text)?;
         if cfg.id_is_auto() {
             cfg.general.id = uuid::Uuid::new_v4().to_string();
-            match replace_id_line(&text, &cfg.general.id) {
+            let edited = replace_id_line(&text, &cfg.general.id)
+                .or_else(|| insert_id_line(&text, &cfg.general.id))
+                // Only keep a text edit that really yields the new id (dotted keys, inline
+                // tables and the like fall back to a full rewrite).
+                .filter(|t| Self::from_toml(t).is_ok_and(|c| c.general.id == cfg.general.id));
+            match edited {
                 Some(new_text) => write_atomic(path, &new_text)?,
                 None => cfg.save(path)?,
             }
@@ -189,9 +197,9 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut errs = Vec::new();
-        if self.general.interval_ms < MIN_INTERVAL_MS {
+        if !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&self.general.interval_ms) {
             errs.push(format!(
-                "general.interval_ms = {} (must be >= {MIN_INTERVAL_MS})",
+                "general.interval_ms = {} (must be {MIN_INTERVAL_MS}..={MAX_INTERVAL_MS})",
                 self.general.interval_ms
             ));
         }
@@ -434,8 +442,9 @@ pub fn parse_target(s: &str, default_port: u16) -> Result<SocketAddr, String> {
     parse_target_spec(s, default_port)?.resolve()
 }
 
-/// RFC 1123 host name syntax. A last label that is all digits is rejected, which catches
-/// mistyped IPv4 addresses such as `192.168.1.300` or `10.0.0`.
+/// RFC 1123 host name syntax, plus `_` (common in Windows/NetBIOS machine names and accepted
+/// by most resolvers). A last label that is all digits is rejected, which catches mistyped
+/// IPv4 addresses such as `192.168.1.300` or `10.0.0`.
 fn check_hostname(h: &str) -> Result<(), String> {
     let h = h.strip_suffix('.').unwrap_or(h);
     let bad = || Err("not an IP address or host name".to_string());
@@ -447,7 +456,9 @@ fn check_hostname(h: &str) -> Result<(), String> {
             && label.len() <= 63
             && !label.starts_with('-')
             && !label.ends_with('-')
-            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
         if !ok {
             return bad();
         }
@@ -469,8 +480,8 @@ fn replace_id_line(text: &str, id: &str) -> Option<String> {
     let mut out = String::with_capacity(text.len() + 40);
     for line in text.split_inclusive('\n') {
         let t = line.trim();
-        if t.starts_with('[') {
-            section = t.trim_matches(|c| c == '[' || c == ']').trim().to_string();
+        if let Some(name) = table_header(t) {
+            section = name;
         } else if !done && section == "general" {
             if let Some((k, _)) = t.split_once('=') {
                 if k.trim() == "id" {
@@ -495,16 +506,98 @@ fn replace_id_line(text: &str, id: &str) -> Option<String> {
     done.then_some(out)
 }
 
+/// The table name of a `[name]` / `[[name]]` header line (comment allowed after it).
+fn table_header(trimmed: &str) -> Option<String> {
+    let rest = trimmed.strip_prefix('[')?;
+    let rest = rest.strip_prefix('[').unwrap_or(rest);
+    let (name, _) = rest.split_once(']')?;
+    Some(name.trim().to_string())
+}
+
+/// Insert an `id` line right below the `[general]` header (or append a `[general]` table
+/// when there is none), keeping everything else byte-for-byte. Used when the file has no
+/// `id` line at all. Returns `None` when there are several `[general]` headers.
+fn insert_id_line(text: &str, id: &str) -> Option<String> {
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let id_line = format!("id = \"{id}\"              # generated; delete to regenerate{nl}");
+    let mut out = String::with_capacity(text.len() + id_line.len() + 12);
+    let mut found = 0;
+    for line in text.split_inclusive('\n') {
+        out.push_str(line);
+        if table_header(line.trim()).as_deref() == Some("general") && !line.trim().starts_with("[[")
+        {
+            found += 1;
+            if !line.ends_with('\n') {
+                out.push_str(nl);
+            }
+            out.push_str(&id_line);
+        }
+    }
+    match found {
+        0 => {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push_str(nl);
+            }
+            if !out.is_empty() {
+                out.push_str(nl);
+            }
+            out.push_str("[general]");
+            out.push_str(nl);
+            out.push_str(&id_line);
+            Some(out)
+        }
+        1 => Some(out),
+        _ => None,
+    }
+}
+
+/// Write `contents` to a uniquely named temp file next to `path`, fsync it, then rename it
+/// over `path`. Concurrent writers (tray and settings window, two processes) never share a
+/// temp file, and a crash leaves either the old or the new file, never a truncated one.
 fn write_atomic(path: &Path, contents: &str) -> Result<(), ConfigError> {
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    if let Some(dir) = dir {
         std::fs::create_dir_all(dir)?;
     }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!(
+        ".{}.{}.{}.{nanos}.tmp",
+        name.as_deref().unwrap_or("config"),
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
+    );
+    let tmp = match dir {
+        Some(d) => d.join(tmp_name),
+        None => PathBuf::from(tmp_name),
+    };
+    let result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        // Persist the rename itself (directory entry). Not possible on Windows; best effort.
+        #[cfg(unix)]
+        if let Ok(d) = std::fs::File::open(dir.unwrap_or(Path::new("."))) {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(result?)
 }
 
 /// The commented default file written on first run. Must parse to `Config::default()` with
@@ -515,7 +608,7 @@ pub fn default_template(id: &str) -> String {
 
 [general]
 host_name = ""            # empty = system hostname
-interval_ms = 1000        # 100 | 200 | 1000 | 5000 | 15000 | 30000 (any value >= 100 accepted)
+interval_ms = 1000        # 100 | 200 | 1000 | 5000 | 15000 | 30000 (any value 100..=3600000 accepted)
 id = "{id}"   # stable per-install id; "auto" = generate once and persist
 
 [network]

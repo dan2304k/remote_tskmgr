@@ -130,8 +130,11 @@ class _Diagnostics extends StatelessWidget {
       '${net.hostCount} hosts',
       '${net.tcpConnections} tcp',
       net.running ? 'running' : 'stopped',
-      if (net.lastError != null) net.lastError!,
+      if (net.bindError != null) net.bindError!,
+      if (net.lastPacketError != null)
+        '${net.lastPacketError!} (${net.lastPacketErrorAge!.inSeconds} s ago)',
     ];
+    final isError = net.bindError != null || net.lastPacketError != null;
     return ListTile(
       key: const ValueKey('diagnostics'),
       leading: Icon(Icons.monitor_heart_outlined, color: c.muted),
@@ -142,9 +145,7 @@ class _Diagnostics extends StatelessWidget {
           context,
           size: 13,
           weight: FontWeight.w400,
-          color: net.lastError != null
-              ? Theme.of(context).colorScheme.error
-              : c.muted,
+          color: isError ? Theme.of(context).colorScheme.error : c.muted,
         ),
       ),
     );

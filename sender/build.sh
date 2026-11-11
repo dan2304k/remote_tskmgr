@@ -28,7 +28,7 @@ done
 
 command -v cargo >/dev/null || { echo "[build] cargo not found; install Rust from https://rustup.rs"; exit 1; }
 echo "[build] $(rustc --version), profile=$PROFILE, variant=$VARIANT"
-(cd "$SENDER_DIR" && cargo build $PROFILE_FLAG -p rtm-sender "${FEATURES[@]}")
+(cd "$SENDER_DIR" && cargo build $PROFILE_FLAG -p rtm-sender ${FEATURES[@]+"${FEATURES[@]}"})
 
 EXE="$SENDER_DIR/target/$PROFILE/rtm-sender"
 mkdir -p "$DIST_DIR"

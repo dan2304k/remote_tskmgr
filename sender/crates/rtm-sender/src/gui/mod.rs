@@ -20,7 +20,7 @@ pub mod splash;
 pub mod tray;
 
 use crate::app::Control;
-use crate::status::SharedStatus;
+use crate::status::{SharedStatus, DAEMON_CRASHED};
 use anyhow::Context;
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::RwLock;
@@ -54,7 +54,8 @@ pub fn interval_label(ms: u64) -> String {
 pub enum GuiEvent {
     OpenSettings,
     Quit,
-    /// The daemon loop returned (Ctrl-C, error); the GUI must go too.
+    /// The daemon loop returned (Ctrl-C, error) or panicked (then `Status::crashed` is set);
+    /// the GUI must go too.
     DaemonExited,
 }
 
@@ -71,12 +72,12 @@ pub struct Ctl {
 }
 
 impl Ctl {
-    /// Validate, register/unregister autostart if that changed, write the TOML, hot-apply.
+    /// Validate, register/unregister autostart if it differs from the real state, write the TOML, hot-apply.
     pub fn save(&self, new: Config) -> anyhow::Result<()> {
         new.validate()?;
         let effective = (self.effective)(new.clone()).context("with command line overrides")?;
-        let old_autostart = self.cfg.read().gui.autostart;
-        if new.gui.autostart != old_autostart {
+        // Compare with the real registration, not the old config: installers register it too.
+        if new.gui.autostart != autostart::is_enabled() {
             autostart::set_autostart(new.gui.autostart).context("autostart")?;
         }
         new.save(&self.path)
@@ -94,6 +95,7 @@ impl Ctl {
             return Ok(());
         }
         c.general.interval_ms = ms;
+        c.gui.autostart = autostart::is_enabled(); // keep the registration as it is
         self.save(c)
     }
 
@@ -105,6 +107,34 @@ impl Ctl {
     pub fn request(&self, ev: GuiEvent) {
         let _ = self.events.send(ev);
     }
+}
+
+/// Sends `DaemonExited` when the daemon thread ends, however it ends. On a panic it first
+/// marks the shared status as crashed so the tray and window show it. The workspace release
+/// profile has `panic = "abort"`, so there a panic kills the whole process (tray included)
+/// and this guard never runs; it matters for unwinding (dev/test) builds.
+struct DaemonExitGuard {
+    status: SharedStatus,
+    events: Sender<GuiEvent>,
+}
+
+impl Drop for DaemonExitGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::error!("{DAEMON_CRASHED}: the daemon thread panicked");
+            let mut s = self.status.write();
+            s.running = true;
+            s.crashed = true;
+            s.last_error = Some(DAEMON_CRASHED.into());
+        }
+        let _ = self.events.send(GuiEvent::DaemonExited);
+    }
+}
+
+/// Run `f` (the daemon loop) with a [`DaemonExitGuard`].
+fn guarded<R>(status: SharedStatus, events: Sender<GuiEvent>, f: impl FnOnce() -> R) -> R {
+    let _guard = DaemonExitGuard { status, events };
+    f()
 }
 
 /// Why the GUI cannot start here, if we can tell up front.
@@ -149,9 +179,9 @@ pub fn run(l: Launch) -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("rtm-daemon".into())
             .spawn(move || {
-                let r = crate::app::run_with_status(cfg, rx, Some(status));
-                let _ = ev_tx.send(GuiEvent::DaemonExited);
-                r
+                guarded(status.clone(), ev_tx, || {
+                    crate::app::run_with_status(cfg, rx, Some(status))
+                })
             })
             .context("spawning daemon thread")?
     };
@@ -308,6 +338,23 @@ mod tests {
         assert!(!ctl.path.exists());
         assert!(rx.try_recv().is_err());
         assert!(ctl.cfg.read().network.tcp_unicast.is_empty());
+    }
+
+    #[test]
+    fn daemon_exit_is_reported_even_on_panic() {
+        let status = SharedStatus::default();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        assert_eq!(guarded(status.clone(), tx.clone(), || 7), 7);
+        assert_eq!(rx.try_recv(), Ok(GuiEvent::DaemonExited));
+        assert!(!status.read().crashed, "a normal return is not a crash");
+
+        let (st, t) = (status.clone(), tx.clone());
+        let h = std::thread::spawn(move || guarded(st, t, || panic!("test panic in daemon")));
+        assert!(h.join().is_err());
+        assert_eq!(rx.try_recv(), Ok(GuiEvent::DaemonExited));
+        let s = status.read();
+        assert!(s.crashed && s.running);
+        assert_eq!(s.last_error.as_deref(), Some(DAEMON_CRASHED));
     }
 
     #[test]

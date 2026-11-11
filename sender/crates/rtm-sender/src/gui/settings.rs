@@ -160,6 +160,16 @@ pub fn gpu_label(b: GpuBackend) -> (&'static str, &'static str) {
 }
 
 impl Form {
+    /// The form for the settings window: `from_config`, with "Start at login" showing whether
+    /// the sender is really registered (an installer may have done it without touching
+    /// `gui.autostart`).
+    pub fn from_config_and_system(c: &Config) -> Self {
+        let mut f = Self::from_config(c);
+        f.autostart = super::autostart::is_enabled();
+        f
+    }
+
+    /// The form for `c` as written (no system state); `to_config` gives `c` back.
     pub fn from_config(c: &Config) -> Self {
         let (iface_mode, iface_names) = match &c.network.broadcast_interfaces {
             BroadcastInterfaces::Named(v) => (IfaceMode::Named, v.clone()),
@@ -363,7 +373,7 @@ struct SettingsApp {
 
 impl SettingsApp {
     fn new(ctl: Ctl, events: Receiver<GuiEvent>, quit: Rc<Cell<bool>>) -> Self {
-        let form = Form::from_config(&ctl.cfg.read());
+        let form = Form::from_config_and_system(&ctl.cfg.read());
         Self {
             ctl,
             events,
@@ -385,7 +395,7 @@ impl SettingsApp {
             Ok(cfg) => match self.ctl.save(cfg) {
                 Ok(()) => {
                     self.errors.clear();
-                    self.form = Form::from_config(&self.ctl.cfg.read());
+                    self.form = Form::from_config_and_system(&self.ctl.cfg.read());
                     self.notice = Some("Saved and applied.".into());
                 }
                 Err(e) => self.errors = vec![format!("{e:#}")],
@@ -394,7 +404,7 @@ impl SettingsApp {
     }
 
     fn revert(&mut self) {
-        self.form = Form::from_config(&self.ctl.cfg.read());
+        self.form = Form::from_config_and_system(&self.ctl.cfg.read());
         self.errors.clear();
         self.notice = Some("Reverted to the saved settings.".into());
     }

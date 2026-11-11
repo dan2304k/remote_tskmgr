@@ -30,7 +30,7 @@ mod temp;
 mod uptime;
 mod util;
 
-pub use cpu::CpuCollector;
+pub use cpu::{cores_detail, CpuCollector};
 pub use disk::DiskCollector;
 pub use gpu::GpuCollector;
 #[cfg(not(windows))]

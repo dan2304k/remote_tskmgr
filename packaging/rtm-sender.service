@@ -3,12 +3,13 @@
 [Unit]
 Description=RTM sender (pushes system stats to RTM viewers on the LAN)
 Documentation=https://github.com/dan2304k/remote_tskmgr
-After=network-online.target
-Wants=network-online.target
+# network-online.target is a system unit; a user unit cannot order against it. The sender
+# copes with no network at start (it retries sends and re-enumerates interfaces).
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/rtm-sender
+# --no-gui: with the gui build, never try to open the tray from a service.
+ExecStart=%h/.local/bin/rtm-sender --no-gui
 Environment=RTM_LOG=info
 Restart=on-failure
 RestartSec=5

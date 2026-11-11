@@ -7,8 +7,8 @@
 //! first one that initialised is used and the others that initialised are kept as a reserve.
 //!
 //! Run-time rules (all backends except Intel sysfs, which is null by design):
-//! * a null read repeats the last value for up to `HOLD_TICKS` ticks, so a single bad tick
-//!   never shows as "-";
+//! * a null read repeats the last value if it is at most `HOLD` (3 s) old, so a single bad
+//!   tick never shows as "-" whatever the interval;
 //! * Auto only: a backend that has never produced a value is replaced by the reserve after
 //!   `MAX_MISSES` null reads in a row. This happens at most once, never back, and never once
 //!   the backend has produced any value (no flip-flopping between backends).
@@ -20,7 +20,7 @@ use crate::GpuBackend;
 use rtm_protocol::Metric;
 use serde_json::{Map, Value};
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub mod adapters;
 pub mod amdgpu;
@@ -38,8 +38,8 @@ pub(crate) mod sysfs;
 /// Consecutive reads without a utilisation value after which Auto tries the reserve backend
 /// (only if the current one has never produced a value).
 pub const MAX_MISSES: u32 = 5;
-/// Null reads for which the last good value is repeated.
-pub const HOLD_TICKS: u32 = 3;
+/// How long the last good value is repeated over null reads.
+pub const HOLD: Duration = Duration::from_secs(3);
 
 /// One GPU backend after successful initialisation.
 pub(crate) trait GpuSource: Send {
@@ -88,8 +88,8 @@ pub struct GpuCollector {
     misses: u32,
     /// `src` has produced a value at least once; it is then never replaced.
     proven: bool,
-    /// Last good value, repeated for up to `HOLD_TICKS` null reads.
-    last: Option<f64>,
+    /// Last good value and when it was read, repeated over null reads for up to `HOLD`.
+    last: Option<(Instant, f64)>,
 }
 
 impl GpuCollector {
@@ -152,8 +152,8 @@ impl GpuCollector {
         self.src.backend()
     }
 
-    /// One read, with the Auto run-time fallback.
-    fn read(&mut self) -> (Option<f64>, Map<String, Value>) {
+    /// One read at `now`, with the Auto run-time fallback.
+    fn read(&mut self, now: Instant) -> (Option<f64>, Map<String, Value>) {
         let (v, mut d) = self.src.read();
         // Name the backend that produced this reading (before a possible switch below).
         d.insert("backend".into(), Value::from(self.src.backend()));
@@ -182,11 +182,14 @@ impl GpuCollector {
         if let Some(v) = v {
             self.misses = 0;
             self.proven = true;
-            self.last = Some(v);
+            self.last = Some((now, v));
             return (Some(v), d);
         }
         self.misses += 1;
-        let held = self.last.filter(|_| self.misses <= HOLD_TICKS);
+        let held = self
+            .last
+            .filter(|(at, _)| now.saturating_duration_since(*at) <= HOLD)
+            .map(|(_, v)| v);
         if !self.proven && self.misses >= MAX_MISSES && !self.rest.is_empty() {
             let from = self.src.backend();
             if let Some((next, proven)) = pick(&mut self.rest, &self.ctx) {
@@ -241,7 +244,13 @@ impl Collector for GpuCollector {
     }
 
     fn sample(&mut self, _dt: Duration) -> Option<Metric> {
-        let (v, d) = self.read();
+        self.sample_at(Instant::now())
+    }
+}
+
+impl GpuCollector {
+    fn sample_at(&mut self, now: Instant) -> Option<Metric> {
+        let (v, d) = self.read(now);
         let name = d.get("name").and_then(Value::as_str).map(str::to_string);
         let index = d
             .get("adapter_index")
@@ -368,8 +377,20 @@ mod tests {
         }))
     }
 
+    thread_local! {
+        /// Fake clock: every test sample is one second after the previous one.
+        static CLOCK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    }
+
     fn sample(c: &mut GpuCollector) -> (Option<f64>, String) {
-        let m = c.sample(Duration::from_secs(1)).unwrap();
+        let now = CLOCK.with(|t| {
+            let n = t
+                .get()
+                .map_or_else(Instant::now, |p| p + Duration::from_secs(1));
+            t.set(Some(n));
+            n
+        });
+        let m = c.sample_at(now).unwrap();
         let v = serde_json::to_value(&m).unwrap();
         let backend = v["detail"]["backend"].as_str().unwrap().to_string();
         (v["v"].as_f64(), backend)
@@ -438,7 +459,8 @@ mod tests {
     }
 
     #[test]
-    fn null_reads_hold_the_last_value_for_three_ticks() {
+    fn null_reads_hold_the_last_value_for_three_seconds() {
+        // One sample per (fake) second, so three null ticks are held and the fourth is not.
         fn blip(_: &Ctx) -> Option<Box<dyn GpuSource>> {
             // probe, 0, then a 2-tick gap, 0, then a long gap
             Some(fake(
@@ -508,6 +530,44 @@ mod tests {
             assert_eq!(sample(&mut c).0, None);
         }
         assert_eq!(c.backend(), "freq");
+    }
+
+    #[test]
+    fn hold_is_time_based_not_tick_based() {
+        fn gap(_: &Ctx) -> Option<Box<dyn GpuSource>> {
+            Some(fake("gap", &[Some(1.0), Some(9.0)], None))
+        }
+        let mut c = GpuCollector::from_candidates(vec![gap], true, Ctx::default()).unwrap();
+        let t0 = Instant::now();
+        assert_eq!(c.read(t0).0, Some(9.0));
+        // 250 ms ticks: twelve null ticks (3 s) are held, the next is not.
+        for i in 1..=12 {
+            assert_eq!(
+                c.read(t0 + Duration::from_millis(250 * i)).0,
+                Some(9.0),
+                "tick {i}"
+            );
+        }
+        assert_eq!(c.read(t0 + Duration::from_millis(3250)).0, None);
+    }
+
+    #[test]
+    fn nvml_is_tried_when_auto_targets_an_nvidia_card() {
+        let t = tempfile::tempdir().unwrap();
+        adapters::tests::igpu_plus_nvidia(t.path(), "0x8086\n", None);
+        let list = adapters::from_sysfs(t.path());
+        let (target, pinned) = adapters::resolve(&list, "auto");
+        let ctx = Ctx {
+            list,
+            target,
+            pinned,
+            strict: true,
+        };
+        assert!(
+            !ctx.declines(adapters::Adapter::is_nvidia),
+            "nvml serves the target"
+        );
+        assert!(ctx.declines(|t| t.vendor == Some(sysfs::VENDOR_INTEL)));
     }
 
     #[test]

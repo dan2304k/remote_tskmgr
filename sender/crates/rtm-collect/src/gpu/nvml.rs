@@ -4,7 +4,9 @@
 //! Hybrid laptops (Optimus): with the dGPU powered down at idle, `nvmlInit` and the device
 //! count succeed but utilisation reads fail (GPU_IS_LOST, NOT_SUPPORTED, UNKNOWN) until the GPU
 //! wakes. A device that enumerates is therefore accepted, and a failed read reports
-//! `v: 0.0` with `detail.state = "asleep"` and `detail.nvml_error`, retried every tick.
+//! `v: 0.0` with `detail.state = "asleep"` and `detail.nvml_error`, retried every tick. Any
+//! other read error reports `v: null` with `detail.state = "unreadable"` (the collector holds
+//! the last value briefly), never a fake 0.
 //!
 //! The device is the one matching the `gpu_adapter` target by name, else the k-th NVIDIA
 //! device where k is the target's position among the NVIDIA adapters detected, else index 0.
@@ -58,18 +60,39 @@ pub(crate) fn device_for(target: Option<&Adapter>, list: &[Adapter], names: &[St
     }
 }
 
-/// A utilisation read: the value, or 0.0 plus a state when the GPU is asleep / unreadable.
-pub(crate) fn util_or_asleep(r: Result<u32, NvmlError>) -> (f64, Option<(&'static str, String)>) {
+/// A utilisation read: the value; 0.0 plus `"asleep"` when the GPU is powered down (GpuLost,
+/// NotSupported, Unknown); `None` plus `"unreadable"` for any other error.
+pub(crate) fn util_or_asleep(
+    r: Result<u32, &NvmlError>,
+) -> (Option<f64>, Option<(&'static str, String)>) {
     match r {
-        Ok(u) => (f64::from(u.min(100)), None),
-        Err(e) => {
-            let state = match e {
-                NvmlError::GpuLost | NvmlError::NotSupported | NvmlError::Unknown => "asleep",
-                _ => "unreadable",
-            };
-            (0.0, Some((state, format!("{e:?}"))))
-        }
+        Ok(u) => (Some(f64::from(u.min(100))), None),
+        Err(e) => match e {
+            NvmlError::GpuLost | NvmlError::NotSupported | NvmlError::Unknown => {
+                (Some(0.0), Some(("asleep", format!("{e:?}"))))
+            }
+            _ => (None, Some(("unreadable", format!("{e:?}")))),
+        },
     }
+}
+
+/// `(PCI bus id, memory total in bytes)` of every NVML device, for the Linux adapter list
+/// (sysfs has no VRAM size for NVIDIA). `None` when NVML is not available.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn memory_totals() -> Option<Vec<super::adapters::NvmlMem>> {
+    let nvml = Nvml::init().ok()?;
+    let count = nvml.device_count().ok()?;
+    Some(
+        (0..count)
+            .map(|i| match nvml.device_by_index(i) {
+                Ok(d) => (
+                    d.pci_info().ok().map(|p| p.bus_id),
+                    d.memory_info().map(|m| m.total).unwrap_or(0),
+                ),
+                Err(_) => (None, 0),
+            })
+            .collect(),
+    )
 }
 
 impl NvmlSource {
@@ -119,8 +142,8 @@ impl GpuSource for NvmlSource {
         }
         let dev = self.nvml.device_by_index(self.index);
         let util = match &dev {
-            Ok(dev) => util_or_asleep(dev.utilization_rates().map(|u| u.gpu)),
-            Err(e) => util_or_asleep(Err(clone_err(e))),
+            Ok(dev) => util_or_asleep(dev.utilization_rates().as_ref().map(|u| u.gpu)),
+            Err(e) => util_or_asleep(Err(e)),
         };
         if let Some((state, err)) = util.1 {
             d.insert("state".into(), Value::from(state));
@@ -139,16 +162,7 @@ impl GpuSource for NvmlSource {
             }
         }
         d.insert("backend".into(), Value::from(self.backend()));
-        (Some(util.0), d)
-    }
-}
-
-/// `NvmlError` is not `Clone`; keep the variants that matter for the asleep mapping.
-fn clone_err(e: &NvmlError) -> NvmlError {
-    match e {
-        NvmlError::GpuLost => NvmlError::GpuLost,
-        NvmlError::NotSupported => NvmlError::NotSupported,
-        _ => NvmlError::Unknown,
+        (util.0, d)
     }
 }
 
@@ -158,20 +172,20 @@ mod tests {
     use crate::gpu::adapters::fake;
 
     #[test]
-    fn asleep_maps_to_zero() {
-        assert_eq!(util_or_asleep(Ok(37)), (37.0, None));
-        assert_eq!(util_or_asleep(Ok(250)).0, 100.0);
+    fn asleep_maps_to_zero_unreadable_to_none() {
+        assert_eq!(util_or_asleep(Ok(37)), (Some(37.0), None));
+        assert_eq!(util_or_asleep(Ok(250)).0, Some(100.0));
         for e in [
             NvmlError::GpuLost,
             NvmlError::NotSupported,
             NvmlError::Unknown,
         ] {
-            let (v, st) = util_or_asleep(Err(e));
-            assert_eq!(v, 0.0);
+            let (v, st) = util_or_asleep(Err(&e));
+            assert_eq!(v, Some(0.0));
             assert_eq!(st.unwrap().0, "asleep");
         }
-        let (v, st) = util_or_asleep(Err(NvmlError::Uninitialized));
-        assert_eq!((v, st.unwrap().0), (0.0, "unreadable"));
+        let (v, st) = util_or_asleep(Err(&NvmlError::Uninitialized));
+        assert_eq!((v, st.unwrap().0), (None, "unreadable"));
     }
 
     #[test]

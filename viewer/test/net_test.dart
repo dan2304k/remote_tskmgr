@@ -292,6 +292,53 @@ void main() {
       },
     );
 
+    test('dispose during start closes what start opened', () async {
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      final calls = <String>[];
+      messenger.setMockMethodCallHandler(MulticastLock.channel, (call) async {
+        calls.add(call.method);
+        // UDP is bound by now; dispose while start is awaiting the lock.
+        if (call.method == 'acquire') net.dispose();
+        return true;
+      });
+      addTearDown(
+        () => messenger.setMockMethodCallHandler(MulticastLock.channel, null),
+      );
+      await net.start();
+      expect(net.running, isFalse);
+      expect(net.multicastLockHeld, isFalse);
+      expect(calls, contains('release'));
+      // Both ports are free again (TCP was never bound).
+      final u = await RawDatagramSocket.bind(loopback, config.udpPort);
+      u.close();
+      final t = await ServerSocket.bind(loopback, config.tcpPort);
+      await t.close();
+    });
+
+    test('start re-evaluates host staleness immediately', () async {
+      var now = DateTime.now();
+      final reg = HostRegistry(now: () => now);
+      final c = NetController(
+        registry: reg,
+        config: config,
+        bindAddress: loopback,
+      );
+      addTearDown(c.dispose);
+      expect(
+        PacketIntake(
+          registry: reg,
+          secret: () => '',
+        ).handleText(line('valid_minimal.json'), 'x'),
+        isTrue,
+      );
+      expect(reg.hosts['min']!.status, HostStatus.live);
+      // As after a long stay in the background.
+      now = now.add(const Duration(minutes: 10));
+      await c.start();
+      expect(reg.hosts['min']!.status, HostStatus.offline);
+    });
+
     test('timer ticks registry and refreshes packetsPerSecond', () async {
       await net.start();
       // Stream at ~5 Hz so the 1 s timer sees a non-zero rate regardless of scheduling.

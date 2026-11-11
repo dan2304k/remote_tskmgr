@@ -25,20 +25,7 @@ set "VARIANT=gui"
 if "%~1"=="" goto :checks
 if /I "%~1"=="headless" ( set "FEATURES=" & set "VARIANT=headless" & shift & goto :parse )
 if /I "%~1"=="debug"    ( set "PROFILE=debug" & set "PROFILE_FLAG=" & shift & goto :parse )
-if /I "%~1"=="clean"    goto :test
-where cargo >nul 2>nul || ( echo [build] cargo not found. Install Rust from https://rustup.rs & exit /b 1 )
-pushd "%SENDER_DIR%" || exit /b 1
-echo [test] cargo test --workspace
-cargo test --workspace
-if errorlevel 1 ( echo [test] workspace tests FAILED & popd & exit /b 1 )
-echo [test] cargo test -p rtm-sender --features gui
-cargo test -p rtm-sender --features gui
-if errorlevel 1 ( echo [test] gui tests FAILED & popd & exit /b 1 )
-popd
-echo [test] all tests passed
-exit /b 0
-
-:clean
+if /I "%~1"=="clean"    goto :clean
 if /I "%~1"=="test"     goto :test
 if /I "%~1"=="help"     goto :usage
 if /I "%~1"=="-h"       goto :usage

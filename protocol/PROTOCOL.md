@@ -79,7 +79,7 @@ different OSes line up on the viewer. Everything else is still allowed.
 
 | key | label | unit | v | detail keys (optional) |
 |---|---|---|---|---|
-| `cpu` | `CPU` | `%` | total utilisation 0–100 | `cores: [number]`, `freq_mhz`, `temp_c`, `load1` |
+| `cpu` | `CPU` | `%` | total utilisation 0–100 | `cores: [number]` (per logical core, at most 16), or instead for more cores `cores_n` (count), `cores_max`, `cores_min`, `cores_top: [[index, pct], ...]` (busiest few, busiest first); `freq_mhz`, `temp_c`, `load1` |
 | `gpu` | `GPU` | `%` | utilisation 0–100, null if unknown | `name`, `vram_used_mb`, `vram_total_mb`, `temp_c`, `freq_mhz`, `backend`, `approx: true` when the value is a proxy |
 | `mem` | `MEM` | `%` | used / total × 100 | `used_mb`, `total_mb`, `swap_used_mb`, `swap_total_mb` |
 | `disk` | `DISK` | `MB/s` | read + write, `max` null | `read_mbps`, `write_mbps`, `disks: {name: {read_mbps, write_mbps}}` |

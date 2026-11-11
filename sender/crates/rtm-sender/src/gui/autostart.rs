@@ -1,4 +1,6 @@
-//! Start-at-login registration, applied when `gui.autostart` changes on Save.
+//! Start-at-login registration. The real state (`is_enabled`) is the source of truth: the
+//! installers register it without touching `gui.autostart`, so Settings shows and changes
+//! the registration itself, and Save applies it whenever it differs from the wish.
 //! Linux: an XDG autostart entry `~/.config/autostart/rtm-sender.desktop`.
 //! Windows: `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\rtm-sender`.
 //! The registered command is this executable plus `--config <path>` when one was given, so a
@@ -14,6 +16,12 @@ pub fn set_autostart(enabled: bool) -> anyhow::Result<()> {
     let config =
         config_arg(std::env::args_os().skip(1)).map(|p| std::path::absolute(&p).unwrap_or(p));
     platform::set(enabled, &exe, config.as_deref())
+}
+
+/// Whether the sender is currently registered to start at login (Windows: the HKCU Run
+/// value exists; Linux: the XDG autostart desktop file exists; elsewhere: never).
+pub fn is_enabled() -> bool {
+    platform::is_enabled()
 }
 
 /// The value of `--config <p>` / `--config=<p>` in `args`, if any.
@@ -91,6 +99,11 @@ pub mod xdg {
         )
     }
 
+    /// Whether `<dir>/rtm-sender.desktop` exists.
+    pub fn desktop_entry_exists(dir: &Path) -> bool {
+        dir.join(DESKTOP_FILE).is_file()
+    }
+
     /// Write or remove `<dir>/rtm-sender.desktop`. Removing a missing file is fine.
     pub fn set_desktop_entry(
         dir: &Path,
@@ -117,14 +130,22 @@ pub mod xdg {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::xdg::{set_desktop_entry, xdg_autostart_dir};
+    use super::xdg::{desktop_entry_exists, set_desktop_entry, xdg_autostart_dir};
     use super::*;
-    pub fn set(enabled: bool, exe: &Path, config: Option<&Path>) -> anyhow::Result<()> {
-        let dir = xdg_autostart_dir(
+
+    fn dir() -> Option<PathBuf> {
+        xdg_autostart_dir(
             std::env::var_os("XDG_CONFIG_HOME"),
             std::env::var_os("HOME"),
         )
-        .context("no XDG_CONFIG_HOME or HOME to put the autostart entry in")?;
+    }
+
+    pub fn is_enabled() -> bool {
+        dir().is_some_and(|d| desktop_entry_exists(&d))
+    }
+
+    pub fn set(enabled: bool, exe: &Path, config: Option<&Path>) -> anyhow::Result<()> {
+        let dir = dir().context("no XDG_CONFIG_HOME or HOME to put the autostart entry in")?;
         set_desktop_entry(&dir, enabled, exe, config)
     }
 }
@@ -137,6 +158,13 @@ mod platform {
 
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const VALUE: &str = "rtm-sender";
+
+    pub fn is_enabled() -> bool {
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(RUN_KEY)
+            .and_then(|k| k.get_raw_value(VALUE))
+            .is_ok()
+    }
 
     pub fn set(enabled: bool, exe: &Path, config: Option<&Path>) -> anyhow::Result<()> {
         let (run, _) = RegKey::predef(HKEY_CURRENT_USER)
@@ -164,6 +192,9 @@ mod platform {
 #[cfg(not(any(target_os = "linux", windows)))]
 mod platform {
     use super::*;
+    pub fn is_enabled() -> bool {
+        false
+    }
     pub fn set(_enabled: bool, _exe: &Path, _config: Option<&Path>) -> anyhow::Result<()> {
         anyhow::bail!("autostart is not implemented on this platform")
     }
@@ -212,6 +243,29 @@ mod tests {
         set_desktop_entry(&dir, false, exe, None).unwrap();
         assert!(!dir.join(DESKTOP_FILE).exists());
         set_desktop_entry(&dir, false, exe, None).unwrap();
+    }
+
+    /// The real `is_enabled`/`set_autostart` path, pointed at a temp XDG_CONFIG_HOME. This is
+    /// the only test that sets XDG_CONFIG_HOME.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn is_enabled_follows_desktop_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        let file = tmp.path().join("autostart").join(DESKTOP_FILE);
+        assert!(!is_enabled());
+        set_autostart(true).unwrap();
+        assert!(file.is_file());
+        assert!(is_enabled());
+        set_autostart(false).unwrap();
+        assert!(!file.exists());
+        assert!(!is_enabled());
+        // A desktop file someone else wrote counts too.
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "[Desktop Entry]\n").unwrap();
+        assert!(is_enabled());
+        // XDG_CONFIG_HOME is left pointing into the temp dir rather than removed, so a racing
+        // test can never reach the developer's real ~/.config/autostart.
     }
 
     #[test]

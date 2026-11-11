@@ -1,5 +1,5 @@
 //! `temp`: hottest CPU temperature sensor in °C (`max` 100), falling back to the hottest
-//! sensor of any kind when no CPU-ish sensor exists. `detail.sensors` lists up to 16 sensors
+//! sensor of any kind when no CPU-ish sensor exists. `detail.sensors` lists up to 6 sensors
 //! of every kind, hottest first.
 
 use crate::cpu::{is_cpu_sensor, valid_temp};
@@ -10,7 +10,8 @@ use serde_json::{Map, Value};
 use std::time::Duration;
 use sysinfo::Components;
 
-const MAX_SENSORS: usize = 16;
+/// Packet size: the hottest few are what matters.
+const MAX_SENSORS: usize = 6;
 
 pub struct TempCollector {
     comps: Components,

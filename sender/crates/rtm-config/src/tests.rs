@@ -76,14 +76,87 @@ fn auto_id_persisted_and_comments_kept() {
 }
 
 #[test]
-fn auto_id_without_id_line_falls_back_to_save() {
+fn missing_id_without_general_table_appends_one() {
     let p = tmp_path("sender.toml");
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-    std::fs::write(&p, "[network]\nudp_port = 49000\n").unwrap();
+    std::fs::write(&p, "# keep me\n[network]\nudp_port = 49000 # mine\n").unwrap();
     let c = Config::load_or_create(&p).unwrap();
+    let text = std::fs::read_to_string(&p).unwrap();
+    assert!(
+        text.starts_with("# keep me\n[network]\nudp_port = 49000 # mine\n"),
+        "{text}"
+    );
+    assert!(text.contains("\n[general]\nid = \""), "{text}");
     let back = Config::load(&p).unwrap();
     assert_eq!(back.general.id, c.general.id);
     assert_eq!(back.network.udp_port, 49000);
+}
+
+#[test]
+fn missing_id_inserted_under_general_keeping_comments() {
+    let p = tmp_path("sender.toml");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let orig = "# top\r\n[general] # hdr\r\ninterval_ms = 5000 # five\r\n\r\n[gui]\r\nautostart = true\r\n";
+    std::fs::write(&p, orig).unwrap();
+    let c = Config::load_or_create(&p).unwrap();
+    uuid::Uuid::parse_str(&c.general.id).unwrap();
+    let text = std::fs::read_to_string(&p).unwrap();
+    let expected_prefix = format!("# top\r\n[general] # hdr\r\nid = \"{}\"", c.general.id);
+    assert!(text.starts_with(&expected_prefix), "{text}");
+    assert!(text.ends_with("interval_ms = 5000 # five\r\n\r\n[gui]\r\nautostart = true\r\n"));
+    let back = Config::load(&p).unwrap();
+    assert_eq!(back.general.id, c.general.id);
+    assert_eq!(back.general.interval_ms, 5000);
+    assert!(back.gui.autostart);
+    // Second load: id present now, file untouched.
+    Config::load_or_create(&p).unwrap();
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
+}
+
+#[test]
+fn dotted_general_id_falls_back_to_full_rewrite() {
+    let p = tmp_path("sender.toml");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "general.interval_ms = 2000\n").unwrap();
+    let c = Config::load_or_create(&p).unwrap();
+    let back = Config::load(&p).unwrap();
+    assert_eq!(back.general.id, c.general.id);
+    assert_eq!(back.general.interval_ms, 2000);
+}
+
+#[test]
+fn write_atomic_leaves_no_temp_files_and_overwrites() {
+    let p = tmp_path("w.toml");
+    write_atomic(&p, "a = 1\n").unwrap();
+    write_atomic(&p, "a = 2\n").unwrap();
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), "a = 2\n");
+    let names: Vec<_> = std::fs::read_dir(p.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("w.toml")]);
+}
+
+#[test]
+fn write_atomic_concurrent_writers_do_not_collide() {
+    let p = tmp_path("c.toml");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    write_atomic(&p, &format!("v = {i}\n")).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let text = std::fs::read_to_string(&p).unwrap();
+    assert!(text.starts_with("v = ") && text.ends_with('\n'), "{text}");
+    assert_eq!(std::fs::read_dir(p.parent().unwrap()).unwrap().count(), 1);
 }
 
 #[test]
@@ -125,6 +198,21 @@ fn validation_errors() {
     assert!(m.contains("interval_ms") && m.contains("udp_port"));
     // Boundary: 10 packets/s is the fastest rate.
     assert!(invalid(|c| c.general.interval_ms = 50).contains("interval_ms"));
+    // Upper bound: one hour.
+    assert!(invalid(|c| c.general.interval_ms = MAX_INTERVAL_MS + 1).contains("interval_ms"));
+    assert!(invalid(|c| c.general.interval_ms = u64::MAX).contains("interval_ms"));
+    let mut c = Config::default();
+    c.general.interval_ms = MAX_INTERVAL_MS;
+    c.validate().unwrap();
+    // Underscores are allowed in host names (Windows machine names).
+    c.network.tcp_unicast = vec!["my_pc:48000".into(), "lab_box.lan".into()];
+    c.validate().unwrap();
+    assert_eq!(
+        parse_target_spec("My_PC:48001", 1),
+        Ok(TargetSpec::Host("my_pc".into(), 48001))
+    );
+    c.network.tcp_unicast = vec!["bad host".into()];
+    assert!(c.validate().is_err());
     let mut c = Config::default();
     c.general.interval_ms = 100;
     c.metrics.gpu_backend = "NVML".into();

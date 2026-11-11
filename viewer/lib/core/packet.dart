@@ -106,6 +106,7 @@ class Packet {
     if (version is! num || version != kProtocolVersion) {
       throw UnsupportedVersionException(version);
     }
+    _rejectNonFinite(json, 'Packet');
     final metricsJson = json['metrics'];
     if (metricsJson == null) {
       throw const FormatException('Packet is missing required field "metrics"');
@@ -232,6 +233,21 @@ Metric _metricFromJson(Map<String, dynamic> json, String key) {
         ? Map<String, dynamic>.unmodifiable(_stringMap(detail))
         : null,
   );
+}
+
+/// Throws [FormatException] if any number anywhere in [value] is NaN or infinite
+/// (`jsonDecode` turns an out-of-range literal like `1e400` into infinity). Such values
+/// cannot be rendered sensibly nor re-serialised for auth, so the whole packet is rejected.
+void _rejectNonFinite(Object? value, String where) {
+  if (value is double && !value.isFinite) {
+    throw FormatException('$where contains a non-finite number');
+  } else if (value is Map) {
+    value.forEach((k, v) => _rejectNonFinite(v, '$where field "$k"'));
+  } else if (value is List) {
+    for (final e in value) {
+      _rejectNonFinite(e, where);
+    }
+  }
 }
 
 Map<String, dynamic> _stringMap(Map m) =>

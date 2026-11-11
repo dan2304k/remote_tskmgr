@@ -8,6 +8,9 @@ use serde_json::{Map, Value};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Re-exported so crates that build packets need no direct dependency of their own.
+pub use serde_json;
+
 type HmacSha256 = Hmac<Sha256>;
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -21,7 +24,8 @@ pub struct Metric {
     pub v: Option<f64>,
     pub unit: String,
     pub label: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Omitted on the wire when 0, the protocol default.
+    #[serde(default, skip_serializing_if = "min_is_default")]
     pub min: Option<f64>,
     /// `Some(None)` would be ambiguous in serde; we model "auto-scale" as `None` and simply omit the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -58,6 +62,10 @@ pub enum ProtocolError {
     Version(u32),
     #[error("invalid packet: {0}")]
     Invalid(String),
+}
+
+fn min_is_default(min: &Option<f64>) -> bool {
+    min.is_none_or(|m| m == 0.0)
 }
 
 impl Metric {

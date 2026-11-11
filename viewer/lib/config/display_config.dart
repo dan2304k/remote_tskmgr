@@ -403,9 +403,7 @@ class DisplayConfig extends ChangeNotifier {
     if (order is List) {
       _hostOrder
         ..clear()
-        ..addAll(
-          order.whereType<String>().where((s) => s.isNotEmpty).toSet(),
-        );
+        ..addAll(order.whereType<String>().where((s) => s.isNotEmpty).toSet());
     }
     final smoothAnim = json['smoothAnimation'];
     if (smoothAnim is bool) _smoothAnimation = smoothAnim;

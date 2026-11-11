@@ -33,9 +33,18 @@ Wire format: [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md). Sender details: [`s
 
 ### 1. Sender on each PC
 
-Build (Rust stable, 1.95+ for the GUI):
+Download from the latest [release](../../releases/latest):
+
+| Asset | For |
+|---|---|
+| `rtm-sender-linux-x86_64` | Linux servers and desktops without a tray: headless, no GTK or display needed |
+| `rtm-sender-gui-linux-x86_64` | Linux desktops: tray icon + settings window. Needs GTK 3 and libayatana-appindicator3 installed, even when run with `--no-gui` |
+| `rtm-sender-windows-x86_64.zip` | Windows: `rtm-sender.exe` (tray + settings) with `install.bat` / `uninstall.bat` |
+| `rtm-sender-windows-x86_64.exe` | Windows: the same exe on its own (run it in place) |
+
+Or build (Rust stable, 1.95+ for the GUI):
 ```
-sender\build.bat            # Windows: tray + settings build -> dist\windows-x86_64\rtm-sender.exe (+ run-at-login.bat)
+sender\build.bat            # Windows: tray + settings build -> dist\windows-x86_64\rtm-sender.exe (+ install.bat, uninstall.bat)
 sender/build.sh             # Linux/macOS: same -> dist/<os>-<arch>/rtm-sender
 sender/build.sh headless    # either script: add "headless" for the no-GUI daemon, "debug" for a debug build
 ```
@@ -50,7 +59,7 @@ Linux GUI build deps: `sudo apt install libgtk-3-dev libayatana-appindicator3-de
 Run:
 ```
 rtm-sender                       # broadcasts on all LAN interfaces every 1 s
-rtm-sender --interval 5s         # 1s | 5s | 15s | 30s (or any ms value >= 250)
+rtm-sender --interval 5s         # 100ms | 200ms | 1s | 5s | 15s | 30s (any value 100 ms .. 1 h)
 rtm-sender --once                # print one packet as JSON and exit (for testing)
 rtm-sender --tcp-unicast 192.168.1.50:48000   # phone on another subnet, or Wi-Fi that drops broadcast
 rtm-sender --print-config        # show the effective config and where the file lives
@@ -61,7 +70,7 @@ see `sender/crates/rtm-sender/README.md` for details.
 
 Install on Windows: `dist\windows-x86_64\install.bat` (per-user, no admin) or `install.bat /system`;
 `packaging/windows/rtm-sender.iss` builds a setup.exe with Inno Setup. Linux: `packaging/README.md` has the
-systemd user unit. Or tick "Start with login" in the GUI settings on either OS.
+systemd user unit. Or tick "Start at login" in the GUI settings on either OS (it shows the installer's registration too).
 
 ### 2. Viewer on the phone
 
@@ -101,11 +110,13 @@ prints what a listener hears.
 ## Development
 
 ```
-cd sender && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings
-cd viewer && flutter analyze && flutter test
+cd sender && cargo fmt --all --check && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings
+cd sender && cargo test -p rtm-sender --features gui && cargo clippy -p rtm-sender --all-targets --features gui -- -D warnings
+cd viewer && dart format --output=none --set-exit-if-changed lib test && flutter analyze && flutter test
 ```
-CI (`.github/workflows/ci.yml`) runs both on every push (Linux + Windows for the sender) and uploads
-the sender binaries and the debug APK. Tags `v*` build release artifacts (`release.yml`).
+CI (`.github/workflows/ci.yml`) runs all of these on every branch push (Linux + Windows for the
+sender, with and without `gui`) and uploads the sender binaries and the debug APK. Tags `v*` publish
+the release assets listed above plus `rtm-viewer.apk` (`release.yml`).
 
 License: MIT.
 

@@ -27,7 +27,13 @@ pub struct Status {
     pub last_bytes: Option<usize>,
     /// Last send/setup error; cleared when sending recovers.
     pub last_error: Option<String>,
+    /// The daemon loop panicked (unwinding builds only; release aborts the process).
+    /// `last_error` then reads [`DAEMON_CRASHED`].
+    pub crashed: bool,
 }
+
+/// `last_error` after the daemon loop panicked.
+pub const DAEMON_CRASHED: &str = "daemon stopped unexpectedly";
 
 #[cfg(test)]
 mod tests {

@@ -204,3 +204,18 @@ fn full_packet_under_1200_bytes() {
 fn now_ms_is_recent() {
     assert!(now_ms() > 1_700_000_000_000);
 }
+
+#[test]
+fn zero_min_is_omitted_on_the_wire() {
+    let m = Metric::percent("CPU", Some(1.0));
+    let s = serde_json::to_string(&m).unwrap();
+    assert!(!s.contains("\"min\""), "{s}");
+    let mut neg = Metric::percent("X", None);
+    neg.min = Some(-5.0);
+    assert!(serde_json::to_string(&neg)
+        .unwrap()
+        .contains("\"min\":-5.0"));
+    // Absent `min` parses as the default.
+    let back: Metric = serde_json::from_str(&s).unwrap();
+    assert_eq!(back.min.unwrap_or(0.0), 0.0);
+}

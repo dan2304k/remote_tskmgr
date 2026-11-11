@@ -7,7 +7,13 @@ import '../core/packet.dart';
 /// Decodes, parses, authenticates and ingests packets, and keeps the diagnostic counters.
 /// One instance is shared by the UDP and TCP listeners of a [NetController].
 class PacketIntake {
-  PacketIntake({required this.registry, required this.secret, this.onAccepted});
+  PacketIntake({
+    required this.registry,
+    required this.secret,
+    this.onAccepted,
+    DateTime Function()? clock,
+    this.errorTtl = const Duration(seconds: 30),
+  }) : _clock = clock ?? registry.clock;
 
   final HostRegistry registry;
 
@@ -31,8 +37,32 @@ class PacketIntake {
   /// Packets handed to the registry and accepted.
   int accepted = 0;
 
+  final DateTime Function() _clock;
+
+  /// How long [lastError] stays visible after the rejection that set it.
+  final Duration errorTtl;
+
+  String? _lastError;
+  DateTime? _lastErrorAt;
+
   /// Human-readable description of the most recent rejected packet, with its source.
-  String? lastError;
+  /// Expires (reads null) [errorTtl] after the rejection, so one stray datagram does
+  /// not leave an error showing forever.
+  String? get lastError {
+    final at = _lastErrorAt;
+    if (_lastError == null || at == null) return null;
+    if (_clock().difference(at) >= errorTtl) return null;
+    return _lastError;
+  }
+
+  /// Time since [lastError] was recorded; null when there is no (unexpired) error.
+  Duration? get lastErrorAge =>
+      lastError == null ? null : _clock().difference(_lastErrorAt!);
+
+  set lastError(String? message) {
+    _lastError = message;
+    _lastErrorAt = message == null ? null : _clock();
+  }
 
   /// Source ("ip:port udp") of the last packet with an unsupported version, for the
   /// "incompatible sender" hint. Null if none seen.
@@ -54,8 +84,19 @@ class PacketIntake {
     return handleText(text, source);
   }
 
-  /// Handles one JSON document. Returns true if the packet was ingested.
+  /// Handles one JSON document. Returns true if the packet was ingested. Never throws:
+  /// this runs inside socket callbacks, where an escaped error would kill the listener.
   bool handleText(String text, String source) {
+    try {
+      return _handleText(text, source);
+    } catch (e) {
+      parseErrors++;
+      lastError = '$source: rejected packet ($e)';
+      return false;
+    }
+  }
+
+  bool _handleText(String text, String source) {
     final Packet packet;
     try {
       packet = Packet.parse(text);

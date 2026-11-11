@@ -46,7 +46,8 @@ impl Meta {
     }
 }
 
-/// Assemble a packet; metrics keep their order. Signs when a secret is set.
+/// Assemble a packet; metrics keep their order. Signs when a secret is set. A packet that
+/// would exceed `PACKET_WARN_BYTES` loses `detail` objects, largest first, until it fits.
 pub fn build_packet(meta: &Meta, seq: u64, ts: u64, metrics: Vec<(String, Metric)>) -> Packet {
     let mut p = Packet {
         v: PROTOCOL_VERSION,
@@ -63,10 +64,50 @@ pub fn build_packet(meta: &Meta, seq: u64, ts: u64, metrics: Vec<(String, Metric
     for (k, m) in metrics {
         p.set_metric(&k, m);
     }
+    if meta.secret.is_some() {
+        // Same length as the real tag, so the size check counts it.
+        p.auth = Some("0".repeat(64));
+    }
+    let dropped = trim_details(&mut p, PACKET_WARN_BYTES);
+    if !dropped.is_empty() {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                ?dropped,
+                "packet over {PACKET_WARN_BYTES} bytes; dropped these metrics' detail (logged once)"
+            );
+        }
+    }
     if let Some(s) = &meta.secret {
         p.sign(s);
     }
     p
+}
+
+fn packet_len(p: &Packet) -> usize {
+    p.to_json().map_or(0, |s| s.len())
+}
+
+/// Last resort against UDP fragmentation: while the packet is over `limit` bytes, remove the
+/// largest `detail` object. Returns the keys of the metrics that lost theirs.
+pub fn trim_details(p: &mut Packet, limit: usize) -> Vec<String> {
+    let mut dropped = Vec::new();
+    while packet_len(p) > limit {
+        let largest = p
+            .metrics
+            .iter()
+            .filter_map(|(k, m)| {
+                let d = m.get("detail")?;
+                Some((d.to_string().len(), k.clone()))
+            })
+            .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        let Some((_, key)) = largest else { break };
+        if let Some(m) = p.metrics.get_mut(&key).and_then(|m| m.as_object_mut()) {
+            m.remove("detail");
+        }
+        dropped.push(key);
+    }
+    dropped
 }
 
 /// Fixed-rate schedule: ticks are at `anchor + k * interval` for k >= 1. Returns the first
@@ -223,6 +264,7 @@ impl State {
             sent: self.sent,
             last_bytes: self.last_bytes,
             last_error: self.last_error.clone(),
+            crashed: false,
         };
     }
 
@@ -421,6 +463,85 @@ mod tests {
         let back = Packet::from_json(&p.to_json().unwrap()).unwrap();
         assert_eq!(back, p);
         assert!(p.to_json().unwrap().len() < 1200);
+    }
+
+    /// Worst case: 128 threads, 4 GPUs with long names, 6 sensors, 4 disks, signed.
+    fn huge() -> Vec<(String, Metric)> {
+        use rtm_protocol::serde_json::{json, Map, Value};
+        let obj = |v: Value| -> Map<String, Value> { v.as_object().unwrap().clone() };
+        let usages: Vec<f64> = (0..128).map(|i| f64::from((i * 37) % 101) + 0.5).collect();
+        let mut cpu: Map<String, Value> = rtm_collect::cores_detail(&usages).into_iter().collect();
+        cpu.insert("freq_mhz".into(), json!(4895));
+        cpu.insert("temp_c".into(), json!(88.0));
+        cpu.insert("load1".into(), json!(123.45));
+        let adapters: Map<String, Value> = (0..4)
+            .map(|i| {
+                (
+                    format!("#{i}"),
+                    json!({"name": format!("NVIDIA GeForce RTX 4090 Laptop GPU number {i}"),
+                           "vram_total_mb": 24564, "util": 99.9, "chosen": i == 0}),
+                )
+            })
+            .collect();
+        let gpu = obj(
+            json!({"name": "NVIDIA GeForce RTX 4090 Laptop GPU number 0",
+            "nvml_index": 0, "adapter_index": 0, "vram_used_mb": 12345, "vram_total_mb": 24564,
+            "temp_c": 77.0, "freq_mhz": 2520, "backend": "nvml", "adapters": adapters,
+            "engines": {"3D": 99.9, "Copy": 12.3, "VideoDecode": 45.6, "VideoEncode": 7.8,
+                        "Compute_0": 55.5, "Compute_1": 66.6}}),
+        );
+        let sensors: Map<String, Value> = (0..6)
+            .map(|i| (format!("coretemp Package id {i} sensor"), json!(80.5)))
+            .collect();
+        let disks: Map<String, Value> = (0..4)
+            .map(|i| {
+                (
+                    format!("nvme{i}n1"),
+                    json!({"read_mbps": 1234.56, "write_mbps": 987.65}),
+                )
+            })
+            .collect();
+        let mut temp = Metric::percent("TEMP", Some(88.0));
+        temp.unit = "°C".into();
+        vec![
+            ("cpu".into(), Metric::percent("CPU", Some(55.5)).with_detail(cpu)),
+            ("gpu".into(), Metric::percent("GPU", Some(99.9)).with_detail(gpu)),
+            ("mem".into(), Metric::percent("MEM", Some(77.7)).with_detail(obj(json!(
+                {"used_mb": 123456, "total_mb": 262144, "swap_used_mb": 1234, "swap_total_mb": 65536}
+            )))),
+            ("disk".into(), Metric::rate_mbps("DISK", Some(2222.21)).with_detail(obj(json!(
+                {"read_mbps": 1234.56, "write_mbps": 987.65, "disks": disks}
+            )))),
+            ("net".into(), Metric::rate_mbps("NET", Some(117.5)).with_detail(obj(json!(
+                {"rx_mbps": 100.25, "tx_mbps": 17.25}
+            )))),
+            ("temp".into(), temp.with_detail(obj(json!({"sensors": sensors})))),
+        ]
+    }
+
+    #[test]
+    fn huge_packet_stays_under_the_fragmentation_limit() {
+        let mut m = meta(Some("secret"));
+        m.host = "a-rather-long-host-name.example.internal".into();
+        let p = build_packet(&m, u64::MAX, u64::MAX, huge());
+        let len = p.to_json().unwrap().len();
+        assert!(len <= PACKET_WARN_BYTES, "{len} bytes");
+        assert!(p.verify("secret"), "signed after trimming");
+        assert_eq!(p.metrics["cpu"]["detail"]["cores_n"], 128);
+    }
+
+    #[test]
+    fn trim_drops_largest_detail_first() {
+        use rtm_protocol::serde_json::{json, Map, Value};
+        let big: Map<String, Value> = (0..200).map(|i| (format!("k{i}"), json!(i))).collect();
+        let small: Map<String, Value> = [("a".to_string(), json!(1))].into_iter().collect();
+        let mut v = sample();
+        v[0].1 = v[0].1.clone().with_detail(small);
+        v[1].1 = v[1].1.clone().with_detail(big);
+        let p = build_packet(&meta(None), 1, 1, v);
+        assert!(p.to_json().unwrap().len() <= PACKET_WARN_BYTES);
+        assert!(p.metrics["cpu"].get("detail").is_none(), "largest dropped");
+        assert_eq!(p.metrics["mem"]["detail"]["a"], 1, "small one kept");
     }
 
     #[test]

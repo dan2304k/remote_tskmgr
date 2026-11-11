@@ -9,26 +9,41 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            artifact: rtm-sender-linux-x86_64
-            bin: rtm-sender
-          - os: windows-2022
-            artifact: rtm-sender-windows-x86_64.exe
-            bin: rtm-sender.exe
+        os: [ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
-    defaults: { run: { working-directory: sender } }
+    defaults: { run: { working-directory: sender, shell: bash } }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxkbcommon-dev
-      - run: cargo build --release -p rtm-sender --features gui
-      - run: cp target/release/${{ matrix.bin }} ../${{ matrix.artifact }}
-        shell: bash
+      # Linux: a headless binary (no GTK needed, for servers) and a tray/GUI binary.
+      - if: runner.os == 'Linux'
+        run: |
+          cargo build --release -p rtm-sender
+          cp target/release/rtm-sender ../rtm-sender-linux-x86_64
+          cargo build --release -p rtm-sender --features gui
+          cp target/release/rtm-sender ../rtm-sender-gui-linux-x86_64
+          echo "ASSETS<<EOF" >> "$GITHUB_ENV"
+          echo "rtm-sender-linux-x86_64" >> "$GITHUB_ENV"
+          echo "rtm-sender-gui-linux-x86_64" >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
+      # Windows: the GUI build (needs no extra libraries), bare and as a zip with the installer.
+      - if: runner.os == 'Windows'
+        run: |
+          cargo build --release -p rtm-sender --features gui
+          cp target/release/rtm-sender.exe ../rtm-sender-windows-x86_64.exe
+          mkdir -p ../zip/rtm-sender
+          cp target/release/rtm-sender.exe ../packaging/windows/install.bat ../packaging/windows/uninstall.bat ../LICENSE ../zip/rtm-sender/
+          cp ../packaging/README.md ../zip/rtm-sender/INSTALL.md
+          (cd ../zip && 7z a -tzip ../rtm-sender-windows-x86_64.zip rtm-sender)
+          echo "ASSETS<<EOF" >> "$GITHUB_ENV"
+          echo "rtm-sender-windows-x86_64.exe" >> "$GITHUB_ENV"
+          echo "rtm-sender-windows-x86_64.zip" >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
       - uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.artifact }}
+          files: ${{ env.ASSETS }}
   viewer:
     runs-on: ubuntu-24.04
     defaults: { run: { working-directory: viewer } }

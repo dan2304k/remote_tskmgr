@@ -26,7 +26,9 @@ sudo apt install libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxkbcomm
 ```
 
 At run time it needs GTK 3, libayatana-appindicator3 (or libappindicator3) and an OpenGL
-driver (Mesa is fine). GNOME needs the "AppIndicator and KStatusNotifierItem Support" extension
+driver (Mesa is fine). The GTK libraries are linked into the `gui` binary, so they must be
+installed even to run it with `--no-gui` or without a display; on a server use the headless
+build (release asset `rtm-sender-linux-x86_64`) instead. GNOME needs the "AppIndicator and KStatusNotifierItem Support" extension
 to show tray icons; KDE, XFCE, Cinnamon and most others show them natively.
 
 Windows needs nothing extra. The `gui` build uses the Windows GUI subsystem, so no console
@@ -63,7 +65,7 @@ Tray menu:
   On Windows the same text is the icon's tooltip. Linux AppIndicator has no tooltips.
 * **Interval 10/s (100 ms) / 5/s (200 ms) / 1 s / 5 s / 15 s / 30 s**: writes
   `general.interval_ms` to the TOML and applies it immediately. The same choices are in
-  Settings → General. Any value of 100 ms or more is accepted in the file or with
+  Settings → General. Any value from 100 ms to 1 hour is accepted in the file or with
   `--interval` (for example `--interval 100ms`). CPU usage and disk/network rates are
   computed at most every 200 ms. At 10/s, every other packet repeats the previous reading
   instead of showing an empty CPU gauge or spiky rates. Each packet still has its own `seq`
@@ -125,8 +127,11 @@ title is used.
 
 ### Autostart
 
-Ticking "Start at login" and pressing Save registers the sender; unticking it and saving
-removes the registration. Nothing changes until you save.
+The "Start at login" checkbox shows whether the sender is registered right now (by this
+checkbox, `install.bat` or the setup.exe), not the `gui.autostart` value in the file. Ticking
+it and pressing Save registers the sender; unticking it and saving removes the registration,
+including one an installer made. Nothing changes until you save. Changing the interval from
+the tray leaves the registration as it is.
 
 * Linux: writes `~/.config/autostart/rtm-sender.desktop` (or under `$XDG_CONFIG_HOME`), with
   `Exec=` set to the running executable and `X-GNOME-Autostart-enabled=true`.
@@ -140,7 +145,10 @@ For a headless machine use the systemd user unit in `packaging/` instead.
 
 ### No display
 
-When the `gui` build cannot start its GUI, it logs a warning and runs exactly like the headless
+The Linux `gui` binary is dynamically linked against GTK 3 and libayatana-appindicator3: if
+those libraries are missing it does not start at all, `--no-gui` included (the loader fails
+before `main`). Use the headless build on machines without them. With the libraries present,
+when the `gui` build cannot start its GUI, it logs a warning and runs exactly like the headless
 build; the GUI never takes the daemon down with it. This happens when:
 
 * `--no-gui` is given;

@@ -69,11 +69,16 @@ class NetController extends ChangeNotifier {
   /// save so broadcasts are not batched to DTIM beacons). Always false off Android.
   bool get wifiLockHeld => _wifiLockHeld;
 
-  /// Bind failure (e.g. port in use) if any, otherwise the last rejected-packet reason.
+  /// Bind failure (e.g. port in use) if any, otherwise the last rejected-packet reason
+  /// (which expires after [PacketIntake.errorTtl]). For the Settings diagnostics row.
   String? get lastError => _bindError ?? _intake.lastError;
 
-  /// Only the bind failure part of [lastError].
+  /// Only the bind failure part of [lastError]; the dashboard banner shows this alone.
   String? get bindError => _bindError;
+
+  /// The last rejected-packet reason while it has not expired, and its age.
+  String? get lastPacketError => _intake.lastError;
+  Duration? get lastPacketErrorAge => _intake.lastErrorAge;
 
   int get udpPort => config.udpPort;
   int get tcpPort => config.tcpPort;
@@ -127,11 +132,14 @@ class NetController extends ChangeNotifier {
     );
     try {
       await udp.start();
+      if (_disposed) return await _abandon(udp: udp);
       _udp = udp;
       await _acquireMulticastLock();
+      if (_disposed) return await _abandon();
     } on SocketException catch (e) {
       errors.add('UDP ${config.udpPort}: ${_describe(e)}');
     }
+    if (_disposed) return await _abandon();
     if (config.tcpEnabled) {
       final tcp = TcpListener(
         intake: _intake,
@@ -141,17 +149,38 @@ class NetController extends ChangeNotifier {
       );
       try {
         await tcp.start();
+        if (_disposed) return await _abandon(tcp: tcp);
         _tcp = tcp;
       } on SocketException catch (e) {
         errors.add('TCP ${config.tcpPort}: ${_describe(e)}');
       }
+      if (_disposed) return await _abandon();
     }
     _bindError = errors.isEmpty
         ? null
         : 'Cannot listen on ${errors.join('; ')}';
     _netSnapshot = _snapshot();
     _ticker ??= Timer.periodic(const Duration(seconds: 1), (_) => _onTick());
+    // Re-evaluate staleness now rather than up to 1 s later: after a resume from the
+    // background, hosts last heard minutes ago must not briefly show as live.
+    _onTick();
     _notify();
+  }
+
+  /// [dispose] ran while [_start] was awaiting: close whatever [_start] opened that
+  /// [dispose] could not see (it only closes [_udp] / [_tcp]) and drop the locks.
+  Future<void> _abandon({UdpListener? udp, TcpListener? tcp}) async {
+    final u = udp ?? _udp;
+    final t = tcp ?? _tcp;
+    _udp = null;
+    _tcp = null;
+    await u?.stop();
+    await t?.stop();
+    if (_multicastLockHeld || _wifiLockHeld) {
+      _multicastLockHeld = false;
+      _wifiLockHeld = false;
+      await MulticastLock.release();
+    }
   }
 
   Future<void> _stop() async {
@@ -189,7 +218,7 @@ class NetController extends ChangeNotifier {
     _packetsPerSecond = registry.packetsPerSecond;
     final diag =
         '$_packetsPerSecond $hostCount ${_intake.errorCount} ${_intake.lastError} '
-        '$_multicastLockHeld $_wifiLockHeld';
+        '${_intake.lastErrorAge?.inSeconds} $_multicastLockHeld $_wifiLockHeld';
     if (diag != _diagSnapshot) {
       _diagSnapshot = diag;
       _notify();
@@ -232,6 +261,7 @@ class NetController extends ChangeNotifier {
 
   @override
   void dispose() {
+    if (_disposed) return; // idempotent
     _disposed = true;
     _debounce?.cancel();
     config.removeListener(_onConfigChanged);

@@ -4,7 +4,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../config/display_config.dart';
 import '../core/host_registry.dart';
@@ -23,56 +22,15 @@ int dashboardColumns(Size size, Orientation o) {
 }
 
 class DashboardScreen extends StatefulWidget {
-  const DashboardScreen({super.key, this.manageWakelock = true});
+  const DashboardScreen({super.key});
 
   static const route = '/';
-
-  /// Hold the screen on while this screen is mounted and config.keepAwake is set.
-  /// Tests pass false (no platform plugin).
-  final bool manageWakelock;
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  DisplayConfig? _config;
-  bool? _wakeOn;
-
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    if (!widget.manageWakelock) return;
-    final c = context.read<DisplayConfig>();
-    if (!identical(c, _config)) {
-      _config?.removeListener(_syncWakelock);
-      _config = c..addListener(_syncWakelock);
-      _syncWakelock();
-    }
-  }
-
-  void _syncWakelock() {
-    final want = _config?.keepAwake ?? false;
-    if (want == _wakeOn) return;
-    _wakeOn = want;
-    unawaited(_setWakelock(want));
-  }
-
-  static Future<void> _setWakelock(bool on) async {
-    try {
-      await WakelockPlus.toggle(enable: on);
-    } catch (e) {
-      debugPrint('rtm: wakelock unavailable: $e');
-    }
-  }
-
-  @override
-  void dispose() {
-    _config?.removeListener(_syncWakelock);
-    if (_wakeOn == true) unawaited(_setWakelock(false));
-    super.dispose();
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -194,7 +152,9 @@ class _ErrorBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final net = context.watch<NetController>();
-    final err = net.lastError;
+    // Only bind failures: per-packet rejections are transient and live in the
+    // Settings diagnostics row, where they expire.
+    final err = net.bindError;
     if (err == null) return const SizedBox.shrink();
     final scheme = Theme.of(context).colorScheme;
     return MaterialBanner(

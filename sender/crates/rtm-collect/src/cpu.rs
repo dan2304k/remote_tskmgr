@@ -1,5 +1,9 @@
 //! `cpu`: global utilisation, per-core %, average frequency, CPU package temperature.
 //!
+//! Up to [`MAX_LISTED_CORES`] logical cores are sent as `detail.cores: [pct, ...]`. Above
+//! that (packet size) a summary replaces it: `cores_n`, `cores_max`, `cores_min` and the
+//! [`TOP_CORES`] busiest as `cores_top: [[index, pct], ...]`, busiest first.
+//!
 //! sysinfo computes usage from the difference between two reads of the kernel counters, so
 //! the collector takes a baseline reading when it is constructed, and two reads must be at
 //! least `sysinfo::MINIMUM_CPU_UPDATE_INTERVAL` (200 ms) apart. Ticks faster than that
@@ -26,6 +30,34 @@ pub(crate) fn is_cpu_sensor(label: &str) -> bool {
 pub(crate) fn valid_temp(t: Option<f32>) -> Option<f64> {
     t.map(f64::from)
         .filter(|t| t.is_finite() && *t > -40.0 && *t < 150.0)
+}
+
+/// Most logical cores sent as a full `cores` list.
+pub const MAX_LISTED_CORES: usize = 16;
+/// Busiest cores listed in `cores_top` when the full list is too long.
+pub const TOP_CORES: usize = 8;
+
+/// The per-core detail keys for these usages (already rounded, 0..=100).
+pub fn cores_detail(usages: &[f64]) -> Vec<(String, Value)> {
+    if usages.len() <= MAX_LISTED_CORES {
+        let cores = usages.iter().map(|&u| num(u)).collect();
+        return vec![("cores".into(), Value::Array(cores))];
+    }
+    let max = usages.iter().copied().fold(f64::MIN, f64::max);
+    let min = usages.iter().copied().fold(f64::MAX, f64::min);
+    let mut idx: Vec<usize> = (0..usages.len()).collect();
+    idx.sort_by(|&a, &b| usages[b].total_cmp(&usages[a]).then(a.cmp(&b)));
+    let top = idx
+        .into_iter()
+        .take(TOP_CORES)
+        .map(|i| Value::Array(vec![Value::from(i), num(usages[i])]))
+        .collect();
+    vec![
+        ("cores_n".into(), Value::from(usages.len())),
+        ("cores_max".into(), num(max)),
+        ("cores_min".into(), num(min)),
+        ("cores_top".into(), Value::Array(top)),
+    ]
 }
 
 pub struct CpuCollector {
@@ -98,9 +130,9 @@ impl Collector for CpuCollector {
 
         let cpus = self.sys.cpus();
         let v = round(f64::from(self.sys.global_cpu_usage()).clamp(0.0, 100.0), 1);
-        let cores: Vec<Value> = cpus
+        let cores: Vec<f64> = cpus
             .iter()
-            .map(|c| num(round(f64::from(c.usage()).clamp(0.0, 100.0), 1)))
+            .map(|c| round(f64::from(c.usage()).clamp(0.0, 100.0), 1))
             .collect();
         let freqs: Vec<u64> = cpus
             .iter()
@@ -109,7 +141,7 @@ impl Collector for CpuCollector {
             .collect();
 
         let mut d = detail();
-        d.insert("cores".into(), Value::Array(cores));
+        d.extend(cores_detail(&cores));
         if !freqs.is_empty() {
             let avg = freqs.iter().sum::<u64>() / freqs.len() as u64;
             d.insert("freq_mhz".into(), Value::from(avg));
@@ -144,6 +176,29 @@ mod tests {
                 assert!(m.v.is_some(), "null at {:?}", start.elapsed());
             }
         }
+    }
+
+    #[test]
+    fn many_cores_are_summarised() {
+        let few: Vec<f64> = (0..16).map(f64::from).collect();
+        let d = cores_detail(&few);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].0, "cores");
+        assert_eq!(d[0].1.as_array().unwrap().len(), 16);
+
+        let many: Vec<f64> = (0..128).map(|i| f64::from((i * 37) % 101)).collect();
+        let d: serde_json::Map<String, Value> = cores_detail(&many).into_iter().collect();
+        assert!(!d.contains_key("cores"));
+        assert_eq!(d["cores_n"], 128);
+        assert_eq!(d["cores_max"], 100.0);
+        assert_eq!(d["cores_min"], 0.0);
+        let top = d["cores_top"].as_array().unwrap();
+        assert_eq!(top.len(), TOP_CORES);
+        assert_eq!(top[0][1], 100.0);
+        let i = top[0][0].as_u64().unwrap() as usize;
+        assert_eq!(many[i], 100.0);
+        let pcts: Vec<f64> = top.iter().map(|e| e[1].as_f64().unwrap()).collect();
+        assert!(pcts.windows(2).all(|w| w[0] >= w[1]), "busiest first");
     }
 
     #[test]
