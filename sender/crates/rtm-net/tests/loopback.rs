@@ -127,13 +127,15 @@ fn tcp_reconnects_after_listener_restart() {
     conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let mut r = BufReader::new(conn);
     s.send(&packet(500)).unwrap();
-    // A recent pending packet may be flushed on connect first; read until ours arrives.
+    // A recent pending packet may be flushed on connect first (on Windows the hang-up is
+    // only noticed when a write fails, so the failed packet, seq 3..9, is the one resent);
+    // read until ours arrives and only require that nothing newer than ours shows up.
     loop {
         let p = read_line(&mut r);
         if p.seq == 500 {
             break;
         }
-        assert!(p.seq >= 100);
+        assert!(p.seq < 500, "unexpected packet seq {}", p.seq);
     }
     assert!(
         start.elapsed() < Duration::from_millis(1500),

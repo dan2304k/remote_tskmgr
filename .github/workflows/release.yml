@@ -2,9 +2,12 @@ name: release
 on:
   push:
     tags: ['v*']
+permissions:
+  contents: write
 jobs:
   sender:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04

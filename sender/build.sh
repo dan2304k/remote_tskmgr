@@ -4,6 +4,7 @@
 #   ./build.sh            release build with the tray icon + settings window (gui feature)
 #   ./build.sh headless   release build without the GUI
 #   ./build.sh debug      debug build with gui
+#   ./build.sh test       run the test suites (headless workspace + rtm-sender with gui)
 #   ./build.sh clean      remove target/ and the dist folder
 #
 # Linux gui build deps: libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxkbcommon-dev libwayland-dev
@@ -18,9 +19,10 @@ for arg in "$@"; do
   case "$arg" in
     headless) FEATURES=(); VARIANT=headless ;;
     debug)    PROFILE=debug; PROFILE_FLAG= ;;
+    test)     (cd "$SENDER_DIR" && cargo test --workspace && cargo test -p rtm-sender --features gui) && echo "[test] all tests passed"; exit $? ;;
     clean)    echo "[build] removing $SENDER_DIR/target and $DIST_DIR"; rm -rf "$SENDER_DIR/target" "$DIST_DIR"; exit 0 ;;
-    help|-h|--help) sed -n '2,9p' "$0"; exit 0 ;;
-    *) echo "unknown option: $arg"; sed -n '2,9p' "$0"; exit 2 ;;
+    help|-h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) echo "unknown option: $arg"; sed -n '2,10p' "$0"; exit 2 ;;
   esac
 done
 
