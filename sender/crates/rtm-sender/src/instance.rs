@@ -4,7 +4,7 @@
 //! process ends, however it ends; the file itself is left in place.
 
 use anyhow::Context;
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 
 /// Process exit code for [`AlreadyRunning`].
@@ -48,9 +48,11 @@ pub fn lock_path(config: &Path) -> PathBuf {
 pub fn acquire(config: &Path) -> anyhow::Result<InstanceLock> {
     let lock = lock_path(config);
     if let Some(dir) = lock.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        rtm_config::create_private_dir(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
     }
-    let file = OpenOptions::new()
+    // 0600 on Unix (a new file); the directory, when created here, 0700.
+    let file = rtm_config::private_open_options()
         .create(true)
         .write(true)
         .truncate(false)
@@ -97,5 +99,17 @@ mod tests {
         drop(first);
         let _again = acquire(&cfg).expect("released on drop");
         drop(other);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_and_new_dir_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("fresh").join("sender.toml");
+        let _l = acquire(&cfg).unwrap();
+        assert_eq!(mode(&lock_path(&cfg)) & 0o077, 0);
+        assert_eq!(mode(cfg.parent().unwrap()) & 0o077, 0);
     }
 }

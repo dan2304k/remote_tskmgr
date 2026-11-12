@@ -46,7 +46,8 @@ window opens when it starts at login.
 ```
 rtm-sender                 # run (tray + settings when built with gui)
 rtm-sender --once          # sample once, print the packet JSON, exit
-rtm-sender --print-config  # show the effective config (file + flags)
+rtm-sender --print-config  # show the effective config (file + flags), secret masked
+rtm-sender --print-config --show-secret   # ... with the shared secret itself
 rtm-sender --no-gui        # gui build: behave exactly like the headless build
 rtm-sender --help
 ```
@@ -60,6 +61,30 @@ On Windows the `gui` build attaches to the parent console when started with `--o
 `--print-config`, `--help` or `--version`, so their output still appears in the terminal. A
 command-line error is printed to the parent console too, or shown in a message box when there
 is none.
+
+### Security and privacy (1.0.2)
+
+* **File permissions (Unix).** `sender.toml` holds `shared_secret`, so it is written with mode
+  0600 on every save (the save replaces the file, so a mode set by hand on the old file does
+  not survive it; 0600 is what you get). The config directory is created with 0700 when the
+  sender creates it; an existing directory is not changed. On load, a `sender.toml` that has a
+  non-empty `shared_secret` and is readable by group or others is set to 0600, with one info
+  line in the log. `sender.log` and `sender.toml.lock` are created with 0600. On Windows
+  nothing changes: `%APPDATA%` is already private to the user.
+* **Secret never printed.** `--print-config` shows `shared_secret = "********"` unless
+  `--show-secret` is given too. The secret is not in the log, the tray status or the settings
+  window's status panel: the config types mask it in their `Debug` output, and a TOML parse
+  error that quotes the `shared_secret` line has the value masked.
+* **Timestamps are strictly increasing.** Viewers with a shared secret reject a packet whose
+  `ts` is not larger than the last one from the same sender id, or is more than 5 minutes off
+  their clock. The sender sends `max(now, previous ts + 1)`, so a clock stepped backwards or
+  two packets in the same millisecond still give a larger `ts`. After a large backward step
+  the timestamps run ahead of the clock until it catches up; keep the clock synced (NTP).
+* **`general.privacy = true`** (Settings → General → "Hide device names in packets"; default
+  `false`) leaves device names out of packets: GPU adapter names become `GPU #N` (N = the
+  detected adapter index) and Windows adapter LUIDs are dropped, disk names become `disk0`,
+  `disk1`, …, sensor names `sensor0`, `sensor1`, …. Values and the per-core CPU arrays are
+  unchanged. The host name is not affected: set `general.host_name` for that.
 
 ### Single instance
 
@@ -109,7 +134,7 @@ Tray menu:
   `open` (macOS) or `xdg-open` (Linux).
 * **Quit** stops the daemon cleanly and exits.
 
-Settings window: General (host name, interval), Network (broadcast on/off and port, interfaces
+Settings window: General (host name, interval, hide device names in packets), Network (broadcast on/off and port, interfaces
 All / Default route / Named list, skip prefixes, UDP and TCP unicast targets, shared secret
 with Show), Metrics (enable and order every known metric, GPU backend, disk include list),
 Startup (start minimized, show a splash on start, start at login).

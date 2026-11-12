@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 
 import '../config/display_config.dart';
 import '../core/host_registry.dart';
+import '../core/packet.dart' show sanitizeDisplayText;
 import 'format.dart';
 import 'grid_math.dart';
 import 'theme.dart';
@@ -47,7 +48,21 @@ class HostDetailScreen extends StatelessWidget {
     final theme = Theme.of(context);
 
     return Scaffold(
-      appBar: AppBar(title: Text(host.latest.host)),
+      appBar: AppBar(
+        title: Text(host.latest.host),
+        actions: [
+          IconButton(
+            key: const ValueKey('detail-remove-host'),
+            tooltip: 'Remove host',
+            icon: const Icon(Icons.delete_outline),
+            onPressed: () {
+              context.read<HostRegistry>().remove(host.id);
+              config.removeHostFromOrder(host.id);
+              Navigator.of(context).maybePop();
+            },
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
         children: [
@@ -147,18 +162,13 @@ class HostDetailScreen extends StatelessWidget {
           _SectionTitle('Packet'),
           _KvTable(
             rows: [
-              MapEntry('id', host.id),
-              MapEntry('os', host.latest.os),
+              MapEntry('id', sanitizeDisplayText(host.id)),
+              MapEntry('os', sanitizeDisplayText(host.latest.os)),
               MapEntry('seq', '${host.latest.seq}'),
               MapEntry('interval', '${host.latest.intervalMs} ms'),
               MapEntry('source', host.lastSource ?? '–'),
               MapEntry('status', host.status.name),
-              MapEntry(
-                'sender clock',
-                DateTime.fromMillisecondsSinceEpoch(host.latest.ts)
-                    .toLocal()
-                    .toString(),
-              ),
+              MapEntry('sender clock', _senderClock(host.latest.ts)),
             ],
             trailing: Padding(
               padding: const EdgeInsets.symmetric(vertical: 6),
@@ -237,4 +247,12 @@ class _KvTable extends StatelessWidget {
       ],
     );
   }
+}
+
+/// The sender's `ts` as local time; out-of-range values (a bogus packet) are shown raw
+/// instead of throwing during build.
+String _senderClock(int ts) {
+  // DateTime supports +-8.64e15 ms around the epoch.
+  if (ts.abs() > 8640000000000000) return '$ts';
+  return DateTime.fromMillisecondsSinceEpoch(ts).toLocal().toString();
 }

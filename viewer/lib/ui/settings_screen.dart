@@ -33,14 +33,27 @@ class SettingsScreen extends StatelessWidget {
             child: Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
               child: Text(
-                'Drag to reorder. New metrics from senders appear here automatically. '
-                '${_styleHint(config.cardLayout)}',
+                'Drag to reorder, swipe to delete. New metrics from senders appear '
+                'here automatically. ${_styleHint(config.cardLayout)}',
                 key: const ValueKey('metrics-hint'),
                 style: TextStyle(color: RtmColors.of(context).muted),
               ),
             ),
           ),
           _MetricsSection(config: config),
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  key: const ValueKey('reset-metrics'),
+                  onPressed: config.resetSlots,
+                  child: const Text('Reset metrics'),
+                ),
+              ),
+            ),
+          ),
           const _Header('Hosts'),
           _HostsSection(config: config),
           SliverToBoxAdapter(child: _HostOrderReset(config: config)),
@@ -113,6 +126,15 @@ class _NetworkSection extends StatelessWidget {
           value: config.sharedSecret,
           onSubmitted: (v) => config.sharedSecret = v,
         ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+          child: Text(
+            'Without a secret any device on this network can send fake stats.',
+            key: const ValueKey('secret-hint'),
+            style: Theme.of(context).textTheme.bodySmall
+                ?.copyWith(color: RtmColors.of(context).muted),
+          ),
+        ),
         const _Diagnostics(),
       ],
     );
@@ -131,6 +153,8 @@ class _Diagnostics extends StatelessWidget {
       '${net.hostCount} hosts',
       '${net.tcpConnections} tcp',
       if (net.droppedOutOfOrder > 0) '${net.droppedOutOfOrder} out of order',
+      if (net.rejectedHosts > 0)
+        '${net.rejectedHosts} from new hosts ignored (host limit)',
       net.running ? 'running' : 'stopped',
       if (net.bindError != null) net.bindError!,
       if (net.lastPacketError != null)
@@ -525,46 +549,53 @@ class _MetricsSection extends StatelessWidget {
       onReorderItem: config.reorder,
       itemBuilder: (context, i) {
         final s = slots[i];
-        return Material(
+        return Dismissible(
           key: ValueKey('slot-${s.key}'),
-          type: MaterialType.transparency,
-          child: ListTile(
-            contentPadding: const EdgeInsets.only(left: 4, right: 8),
-            leading: ReorderableDragStartListener(
-              index: i,
-              child: const Padding(
-                padding: EdgeInsets.all(8),
-                child: Icon(Icons.drag_indicator),
+          onDismissed: (_) => config.removeSlot(s.key),
+          background: ColoredBox(
+            color: Theme.of(context).colorScheme.errorContainer,
+            child: const Icon(Icons.delete_outline),
+          ),
+          child: Material(
+            type: MaterialType.transparency,
+            child: ListTile(
+              contentPadding: const EdgeInsets.only(left: 4, right: 8),
+              leading: ReorderableDragStartListener(
+                index: i,
+                child: const Padding(
+                  padding: EdgeInsets.all(8),
+                  child: Icon(Icons.drag_indicator),
+                ),
               ),
-            ),
-            title: Text(s.key),
-            trailing: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // Dimmed (still editable) outside the Custom layout.
-                Opacity(
-                  opacity: config.cardLayout == CardLayout.custom ? 1 : 0.5,
-                  child: DropdownButton<TileStyle>(
-                    key: ValueKey('style-${s.key}'),
-                    value: s.style,
-                    underline: const SizedBox.shrink(),
-                    items: [
-                      for (final t in TileStyle.values)
-                        DropdownMenuItem(
-                          value: t,
-                          child: Text(_styleNames[t]!),
-                        ),
-                    ],
-                    onChanged: (t) {
-                      if (t != null) config.setSlotStyle(s.key, t);
-                    },
+              title: Text(s.key),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Dimmed (still editable) outside the Custom layout.
+                  Opacity(
+                    opacity: config.cardLayout == CardLayout.custom ? 1 : 0.5,
+                    child: DropdownButton<TileStyle>(
+                      key: ValueKey('style-${s.key}'),
+                      value: s.style,
+                      underline: const SizedBox.shrink(),
+                      items: [
+                        for (final t in TileStyle.values)
+                          DropdownMenuItem(
+                            value: t,
+                            child: Text(_styleNames[t]!),
+                          ),
+                      ],
+                      onChanged: (t) {
+                        if (t != null) config.setSlotStyle(s.key, t);
+                      },
+                    ),
                   ),
-                ),
-                Switch(
-                  value: s.visible,
-                  onChanged: (v) => config.setSlotVisible(s.key, v),
-                ),
-              ],
+                  Switch(
+                    value: s.visible,
+                    onChanged: (v) => config.setSlotVisible(s.key, v),
+                  ),
+                ],
+              ),
             ),
           ),
         );
@@ -576,7 +607,8 @@ class _MetricsSection extends StatelessWidget {
 // ---------------------------------------------------------------- Hosts
 
 /// Hosts in dashboard order; drag the handle to reorder (saved as
-/// [DisplayConfig.hostOrder]). Offline hosts can be removed here.
+/// [DisplayConfig.hostOrder]). Any host can be removed here; a live one comes back
+/// with its next packet.
 class _HostsSection extends StatelessWidget {
   const _HostsSection({required this.config});
   final DisplayConfig config;
@@ -620,19 +652,26 @@ class _HostsSection extends StatelessWidget {
             // The registry no longer notifies per packet: AgeText refreshes itself.
             subtitle: Row(
               children: [
-                Text('${h.status.name} · '),
+                Icon(osIcon(h.latest.os), size: 14, color: c.muted),
+                const SizedBox(width: 4),
+                Flexible(
+                  child: Text(
+                    '${h.status.name} · ',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
                 AgeText(lastSeen: h.lastSeen),
               ],
             ),
-            trailing: h.status == HostStatus.offline
-                ? TextButton(
-                    onPressed: () {
-                      reg.remove(h.id);
-                      config.removeHostFromOrder(h.id);
-                    },
-                    child: const Text('Remove'),
-                  )
-                : Icon(osIcon(h.latest.os), color: c.muted),
+            trailing: TextButton(
+              key: ValueKey('remove-host-${h.id}'),
+              onPressed: () {
+                reg.remove(h.id);
+                config.removeHostFromOrder(h.id);
+              },
+              child: const Text('Remove'),
+            ),
           ),
         );
       },

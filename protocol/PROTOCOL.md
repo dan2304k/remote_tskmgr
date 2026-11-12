@@ -18,6 +18,26 @@ file in `examples/`. Change this file first, then the code.
 * Keep packets under 1200 bytes. Senders warn above 1400 bytes (UDP fragmentation risk).
 * A viewer must tolerate unknown fields anywhere and unknown metric keys.
 
+### Viewer limits
+
+Everything a viewer receives is untrusted LAN input. The reference viewer (1.0.2+) enforces
+these limits; a conforming sender never comes near them:
+
+| Limit | Value | On violation |
+|---|---|---|
+| datagram / TCP line size | 8 KiB (8192 bytes) | packet rejected before decoding (TCP: connection dropped) |
+| JSON nesting depth (packet object = 1) | 16 | packet rejected before decoding |
+| metrics per packet | 32 | packet rejected |
+| metric key | `^[a-z][a-z0-9_]{0,31}$` | that metric is dropped, the rest of the packet is kept |
+| `id`, `host` length | 64 characters | packet rejected |
+| metric `label` / `unit` length | 12 / 8 characters | packet rejected |
+| `interval_ms` used for timing | clamped to 100 ms – 60 s | (staleness, offline, idle timeouts never exceed what 60 s implies) |
+| hosts tracked | 64 | the oldest non-live host is evicted; if all are live the new `id` is ignored |
+| metric display slots (persisted) | 64 | new keys beyond the cap get no slot |
+| TCP connections | 32 total, 4 per remote IP | the connection idle longest is closed to make room |
+
+Control characters and Unicode bidi overrides are stripped from displayed strings.
+
 ## Packet
 
 ```json
@@ -42,7 +62,7 @@ file in `examples/`. Change this file first, then the code.
 | `os` | string | yes | `linux`, `windows`, `macos`, or another lowercase token. Used only to pick an icon |
 | `ts` | integer | yes | sender wall-clock, milliseconds since Unix epoch |
 | `seq` | integer | yes | increases by 1 per packet since daemon start. Viewers may use it to detect loss; it is not required to be continuous across daemon restarts |
-| `interval_ms` | integer | yes | the sender's current interval, >= 100. Viewers compute staleness from it (see Host lifecycle) |
+| `interval_ms` | integer | yes | the sender's current interval, >= 100. Viewers compute staleness from it (see Host lifecycle), clamped to at most 60000 |
 | `metrics` | object | yes | map of metric key → Metric. May be empty |
 | `auth` | string | no | lowercase hex HMAC-SHA256 over the canonical body (see Auth). Absent when no secret is configured |
 
@@ -68,7 +88,8 @@ file in `examples/`. Change this file first, then the code.
 | `max` | number or null | no | upper bound for gauges. Absent or `null` means auto-scale from recent samples |
 | `detail` | object | no | free-form key → scalar / list of scalars / nested object. Shown as a key/value table in the expanded view. Keys snake_case. Viewers never need `detail` to render the tile |
 
-Metric keys are lowercase `snake_case`. A metric that is not available on a host at all is
+Metric keys are lowercase `snake_case`, at most 32 characters (`^[a-z][a-z0-9_]{0,31}$`); at
+most 32 metrics per packet. A metric that is not available on a host at all is
 **omitted** (not sent as null). A viewer that has a display slot for an omitted key may show a
 dimmed placeholder so cards stay aligned; it must not show a gauge at zero.
 
@@ -114,8 +135,27 @@ Numbers that must not appear in an authenticated packet (no verifier can reprodu
 bytes, so a viewer with a secret set rejects the packet): the integer token `-0`, integers
 outside the signed 64-bit range (≥ 2^63 or < −2^63), and non-finite values (rejected always).
 
+**Replay protection.** A viewer with a secret configured also rejects (as an auth failure) a
+correctly signed packet whose `ts`
+* differs from the viewer's own clock by more than **5 minutes** ("stale timestamp"), or
+* is not strictly greater than the `ts` of the last accepted packet from the same `id`
+  (an exact repeat of that packet, same `ts` and `seq`, is dropped silently as a duplicate).
+
+The last-`ts` table is kept in memory only; after a viewer restart the 5-minute window bounds
+what can be replayed. Signed senders and the viewer therefore **must have roughly correct
+clocks** (phones and PCs normally do via NTP / network time); a sender whose clock is more than
+5 minutes off is rejected with "stale timestamp" until it is fixed.
+
+**Without a secret there is no authentication at all**: any device on the LAN can send
+packets with any `id`, impersonate an existing host, or invent new ones. Packets are never
+encrypted either, with or without a secret: every broadcast discloses to the whole network
+the sender's hostname, its stable `id`, its load figures, and device names in `detail`
+(e.g. GPU model, disk names, sensor names).
+
 `examples/valid_with_auth.json` is signed with the secret `correct horse` over the whole file
-(its `_comment` included); both implementations must verify it.
+(its `_comment` included); both implementations must verify it (its `ts` is long past, so a
+viewer applying the replay rule above rejects it when it arrives over the network; it is a
+test vector for the HMAC only).
 
 ## Host lifecycle on the viewer
 
@@ -123,7 +163,7 @@ outside the signed 64-bit range (≥ 2^63 or < −2^63), and non-finite values (
 |---|---|
 | live | packet received within 3 × `interval_ms` |
 | stale | no packet for max(2 s, 3 × `interval_ms`); card greys out, last values shown |
-| offline | no packet for max(30 s, 6 × `interval_ms`); card collapses to a header; removable by the user |
+| offline | no packet for max(30 s, 6 × `interval_ms`); card collapses to a header. The user can remove any host (live ones reappear with their next packet) |
 
 Viewers also drop duplicates: a packet whose `seq` is not greater than the last accepted one
 from the same `id` (and whose `ts` is within 5 s of it) is ignored. Senders broadcasting on

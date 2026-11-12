@@ -10,6 +10,7 @@ mod cli;
 mod gui;
 mod instance;
 mod logging;
+mod privacy;
 mod reload;
 mod status;
 
@@ -80,8 +81,7 @@ fn real_main(cli: &cli::Cli, path: &Path) -> anyhow::Result<()> {
     if cli.print_config {
         let mut cfg = file_cfg;
         cli.apply_overrides(&mut cfg);
-        println!("# {}", path.display());
-        print!("{}", cfg.to_toml_string()?);
+        print!("{}", cli::render_config(&path, &cfg, cli.show_secret)?);
         cfg.validate()?;
         return Ok(());
     }

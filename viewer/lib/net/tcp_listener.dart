@@ -4,30 +4,43 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
+import '../core/host_registry.dart' show clampIntervalMs;
+import '../core/packet.dart' show kMaxPacketBytes;
 import 'packet_intake.dart';
 
 /// Longest line (one packet) buffered before the connection is dropped.
-const int kTcpMaxLineBytes = 64 * 1024;
+const int kTcpMaxLineBytes = kMaxPacketBytes;
 
 /// Floor of the idle timeout; see [tcpIdleTimeout].
 const Duration kTcpMinIdleTimeout = Duration(seconds: 15);
 
-/// Concurrent sender connections; extra connections are closed at once.
+/// Ceiling of the idle timeout, whatever interval the peer claims.
+const Duration kTcpMaxIdleTimeout = Duration(seconds: 120);
+
+/// Concurrent sender connections in total; see [TcpListener] for what happens when full.
 const int kTcpMaxConnections = 32;
 
+/// Concurrent connections from one remote IP address.
+const int kTcpMaxConnectionsPerIp = 4;
+
 /// How long a connection may go without a complete line: max([minimum], 5 x the
-/// sender's interval) once its interval is known, else [minimum].
+/// sender's interval, clamped by [clampIntervalMs]) once its interval is known, else
+/// [minimum]; never more than [kTcpMaxIdleTimeout] (unless [minimum] is larger).
 Duration tcpIdleTimeout(Duration minimum, int? intervalMs) {
   if (intervalMs == null || intervalMs <= 0) return minimum;
-  final five = Duration(milliseconds: intervalMs * 5);
-  return five > minimum ? five : minimum;
+  var t = Duration(milliseconds: clampIntervalMs(intervalMs) * 5);
+  if (t > kTcpMaxIdleTimeout) t = kTcpMaxIdleTimeout;
+  return t > minimum ? t : minimum;
 }
 
 /// Accepts sender connections; each `\n`-terminated line is one packet fed to [intake].
 ///
 /// Hardened against misbehaving peers: a line longer than [maxLineBytes] drops the
 /// connection, a connection without a complete line for [tcpIdleTimeout] is closed,
-/// and at most [maxConnections] are open at once (extras are closed immediately).
+/// one remote IP may hold at most [maxConnectionsPerIp], and at most [maxConnections]
+/// are open at once. When either limit is hit the connection that has gone longest
+/// without a complete line (from that IP, or overall) is closed to make room, so idle
+/// squatters cannot lock out a real sender.
 class TcpListener {
   TcpListener({
     required this.intake,
@@ -37,6 +50,7 @@ class TcpListener {
     this.maxLineBytes = kTcpMaxLineBytes,
     this.minIdleTimeout = kTcpMinIdleTimeout,
     this.maxConnections = kTcpMaxConnections,
+    this.maxConnectionsPerIp = kTcpMaxConnectionsPerIp,
   }) : address = address ?? InternetAddress.anyIPv4;
 
   final PacketIntake intake;
@@ -51,13 +65,15 @@ class TcpListener {
   final int maxLineBytes;
   final Duration minIdleTimeout;
   final int maxConnections;
+  final int maxConnectionsPerIp;
 
-  /// Connections refused because [maxConnections] were open (diagnostics).
+  /// Connections closed to make room for a newcomer because [maxConnections] or
+  /// [maxConnectionsPerIp] was reached (diagnostics).
   int rejectedConnections = 0;
 
   ServerSocket? _server;
   StreamSubscription<Socket>? _serverSub;
-  final Map<Socket, void Function()> _sockets = {};
+  final Map<Socket, _Conn> _sockets = {};
 
   bool get isListening => _server != null;
 
@@ -78,20 +94,42 @@ class TcpListener {
     );
   }
 
-  void _onConnection(Socket socket) {
-    if (_sockets.length >= maxConnections) {
-      rejectedConnections++;
-      intake.lastError =
-          'TCP: refused a connection ($maxConnections already open)';
-      socket.destroy();
-      return;
+  /// Closes the open connection (optionally only those from [ip]) that has gone
+  /// longest without a complete line.
+  void _evictIdlest({String? ip}) {
+    _Conn? idlest;
+    for (final c in _sockets.values) {
+      if (ip != null && c.ip != ip) continue;
+      if (idlest == null || c.lastLine < idlest.lastLine) idlest = c;
     }
+    if (idlest == null) return;
+    rejectedConnections++;
+    intake.lastError =
+        '${idlest.source}: closed the idlest connection to make room '
+        '(${ip == null ? '$maxConnections open' : '$maxConnectionsPerIp from $ip'})';
+    idlest.close();
+  }
+
+  void _onConnection(Socket socket) {
+    final String ip;
     final String source;
     try {
-      source = '${socket.remoteAddress.address}:${socket.remotePort} tcp';
+      ip = socket.remoteAddress.address;
+      source = '$ip:${socket.remotePort} tcp';
     } on SocketException {
       socket.destroy();
       return;
+    }
+    if (maxConnections <= 0 || maxConnectionsPerIp <= 0) {
+      socket.destroy();
+      return;
+    }
+    while (_sockets.values.where((c) => c.ip == ip).length >=
+        maxConnectionsPerIp) {
+      _evictIdlest(ip: ip);
+    }
+    while (_sockets.length >= maxConnections) {
+      _evictIdlest();
     }
     var closed = false;
     Timer? idle;
@@ -109,7 +147,10 @@ class TcpListener {
       onConnectionsChanged?.call();
     }
 
+    final conn = _Conn(ip, source, close, _clock.elapsedMicroseconds);
+
     void armIdle() {
+      conn.lastLine = _clock.elapsedMicroseconds;
       idle?.cancel();
       idle = Timer(tcpIdleTimeout(minIdleTimeout, intervalMs), () {
         intake.lastError = '$source: no complete line in time, closed';
@@ -147,7 +188,7 @@ class TcpListener {
       close();
     }
 
-    _sockets[socket] = close;
+    _sockets[socket] = conn;
     onConnectionsChanged?.call();
     armIdle();
     sub = socket.listen(
@@ -194,8 +235,21 @@ class TcpListener {
     await _server?.close();
     _server = null;
     final open = _sockets.values.toList();
-    for (final close in open) {
-      close();
+    for (final c in open) {
+      c.close();
     }
   }
+
+  /// Monotonic clock for [_Conn.lastLine].
+  final Stopwatch _clock = Stopwatch()..start();
+}
+
+class _Conn {
+  _Conn(this.ip, this.source, this.close, this.lastLine);
+  final String ip;
+  final String source;
+  final void Function() close;
+
+  /// [TcpListener._clock] microseconds at the last complete line (or the connect).
+  int lastLine;
 }

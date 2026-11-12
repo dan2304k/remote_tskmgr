@@ -34,9 +34,18 @@ Edits to the file are applied while the sender runs (interval, targets, host nam
 secret, metrics). Check a config without sending anything:
 
 ```sh
-rtm-sender --print-config     # effective config (file + flags)
+rtm-sender --print-config     # effective config (file + flags); secret shown as "********"
+rtm-sender --print-config --show-secret   # including the shared secret
 rtm-sender --once             # one JSON packet on stdout
 ```
+
+Since 1.0.2, on Linux and macOS `sender.toml` (it holds `shared_secret`), `sender.log` and
+`sender.toml.lock` are created with mode 0600 and a config folder the sender creates with 0700.
+An existing `sender.toml` with a secret that others can read is set to 0600 when the sender
+loads it. Nothing changes on Windows (`%APPDATA%` is per-user). With a shared secret set,
+keep the sender's clock synced: 1.0.2 viewers reject packets more than 5 minutes off their
+own clock. `[general] privacy = true` (Settings → General → "Hide device names in packets")
+sends `GPU #0`, `disk0`, `sensor0` instead of adapter, disk and sensor names.
 
 Only one sender runs per config file. It holds a lock on `sender.toml.lock` next to the config;
 a second copy started with the same config exits with exit code 3 and "already running" (on

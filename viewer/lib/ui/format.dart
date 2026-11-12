@@ -54,12 +54,13 @@ List<MapEntry<String, String>> flattenDetail(
 ]) {
   final out = <MapEntry<String, String>>[];
   for (final e in m.entries) {
-    final k = prefix.isEmpty ? e.key : '$prefix.${e.key}';
+    final name = sanitizeDisplayText(e.key);
+    final k = prefix.isEmpty ? name : '$prefix.$name';
     final v = e.value;
     if (v is Map) {
       out.addAll(flattenDetail(Map<String, dynamic>.from(v), k));
     } else {
-      out.add(MapEntry(k, formatDetail(v)));
+      out.add(MapEntry(k, sanitizeDisplayText(formatDetail(v))));
     }
   }
   return out;

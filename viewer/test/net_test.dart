@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rtm_viewer/config/display_config.dart';
 import 'package:rtm_viewer/core/host_registry.dart';
+import 'package:rtm_viewer/core/packet.dart';
 import 'package:rtm_viewer/net/multicast_lock.dart';
 import 'package:rtm_viewer/net/net_controller.dart';
 import 'package:rtm_viewer/net/packet_intake.dart';
@@ -15,6 +16,16 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'fixtures_util.dart';
 
 final loopback = InternetAddress.loopbackIPv4;
+
+/// [j] re-signed with [key] and stamped with the current time (signed packets must be
+/// within the viewer's clock window; the golden ts is from 2025).
+String signedNow(Map<String, dynamic> j, String key, {int? ts}) {
+  j
+    ..remove('auth')
+    ..['ts'] = ts ?? DateTime.now().millisecondsSinceEpoch;
+  j['auth'] = Packet.computeAuth(j, key);
+  return jsonEncode(j);
+}
 
 /// Compact one-line JSON of a fixture (fixtures are pretty-printed).
 String line(String fixture, [void Function(Map<String, dynamic>)? edit]) {
@@ -105,14 +116,18 @@ void main() {
       final port = udp.boundPort!;
       // No auth at all, then a signed packet whose body was tampered after signing.
       await sendUdp(port, line('valid_minimal.json'));
-      await sendUdp(
-        port,
-        line('valid_with_auth.json', (j) => j['host'] = 'evil'),
-      );
+      final tampered = jsonDecode(
+        signedNow(fixtureJson('valid_with_auth.json'), secret),
+      )..['host'] = 'evil';
+      await sendUdp(port, jsonEncode(tampered));
       await eventually(() => intake.authFailures == 2);
       expect(registry.hosts, isEmpty);
-      // The golden file as shipped is correctly signed with 'correct horse'.
-      await sendUdp(port, line('valid_with_auth.json'));
+      // Correctly signed with a current ts (the golden file itself is verified in
+      // packet_test; its 2025 ts is outside the clock window).
+      await sendUdp(
+        port,
+        signedNow(fixtureJson('valid_with_auth.json'), secret),
+      );
       await eventually(() => registry.hosts.containsKey('auth-box'));
       expect(intake.accepted, 1);
     });
@@ -201,6 +216,7 @@ void main() {
       int maxLineBytes = kTcpMaxLineBytes,
       Duration minIdle = kTcpMinIdleTimeout,
       int maxConnections = kTcpMaxConnections,
+      int maxPerIp = kTcpMaxConnectionsPerIp,
     }) async {
       final tcp = TcpListener(
         intake: intake,
@@ -209,24 +225,33 @@ void main() {
         maxLineBytes: maxLineBytes,
         minIdleTimeout: minIdle,
         maxConnections: maxConnections,
+        maxConnectionsPerIp: maxPerIp,
       );
       await tcp.start();
       addTearDown(tcp.stop);
       return tcp;
     }
 
-    test('defaults: 64 KB lines, 15 s idle floor, 32 connections', () {
-      expect(kTcpMaxLineBytes, 65536);
+    test('defaults: 8 KB lines, 15-120 s idle, 32 connections, 4 per IP', () {
+      expect(kTcpMaxLineBytes, 8192);
       expect(kTcpMinIdleTimeout, const Duration(seconds: 15));
+      expect(kTcpMaxIdleTimeout, const Duration(seconds: 120));
       expect(kTcpMaxConnections, 32);
+      expect(kTcpMaxConnectionsPerIp, 4);
     });
 
-    test('idle timeout is max(floor, 5 x interval)', () {
+    test('idle timeout is max(floor, 5 x clamped interval), at most 120 s', () {
       const floor = Duration(seconds: 15);
       expect(tcpIdleTimeout(floor, null), floor);
       expect(tcpIdleTimeout(floor, 1000), floor);
       expect(tcpIdleTimeout(floor, 10000), const Duration(seconds: 50));
       expect(tcpIdleTimeout(floor, 0), floor);
+      expect(tcpIdleTimeout(floor, 60000), const Duration(seconds: 120));
+      // A peer claiming interval_ms = 1e12 does not get a 158-year timeout.
+      expect(
+        tcpIdleTimeout(floor, 1000000000000),
+        const Duration(seconds: 120),
+      );
     });
 
     test('a line over the cap drops the connection', () async {
@@ -286,27 +311,68 @@ void main() {
       sock.destroy();
     });
 
-    test('connections beyond the cap are refused', () async {
-      final tcp = await listener(maxConnections: 2);
+    test('at the global cap the idlest connection makes room', () async {
+      final tcp = await listener(maxConnections: 2, maxPerIp: 10);
       final a = await Socket.connect(loopback, tcp.boundPort!);
+      final aClosed = closedByPeer(a);
+      await eventually(() => tcp.connections == 1);
       final b = await Socket.connect(loopback, tcp.boundPort!);
       await eventually(() => tcp.connections == 2);
-      final c = await Socket.connect(loopback, tcp.boundPort!);
-      await closedByPeer(c);
-      expect(tcp.connections, 2);
-      expect(tcp.rejectedConnections, 1);
-      // The open ones still work.
-      a.write('${line('valid_minimal.json')}\n');
-      await a.flush();
+      // b sends a line, so a (silent since connecting) is the idlest.
+      b.write('${line('valid_minimal.json')}\n');
+      await b.flush();
       await eventually(() => registry.hosts.containsKey('min'));
-      a.destroy();
-      await eventually(() => tcp.connections == 1);
-      // A slot is free again.
-      final d = await Socket.connect(loopback, tcp.boundPort!);
-      await eventually(() => tcp.connections == 2);
+      final c = await Socket.connect(loopback, tcp.boundPort!);
+      await aClosed;
+      await eventually(() => tcp.rejectedConnections == 1);
+      expect(tcp.connections, 2);
+      // The newcomer works.
+      c.write('${line('valid_full.json')}\n');
+      await c.flush();
+      await eventually(() => registry.hosts.length == 2);
       b.destroy();
-      d.destroy();
+      c.destroy();
     });
+
+    test(
+      '32 squatters with a huge interval cannot lock out a sender',
+      () async {
+        // Reviewer's shape: 32 connections (the global cap), each sending one line
+        // claiming interval_ms = 1e12, then idling. All come from 127.0.0.1, so the
+        // per-IP limit keeps only 4 of them, and a real sender still gets in.
+        final tcp = await listener();
+        final squatters = <Socket>[];
+        for (var i = 0; i < 32; i++) {
+          final s = await Socket.connect(loopback, tcp.boundPort!);
+          s.listen((_) {}, onError: (_) {});
+          s.write(
+            '${line('valid_minimal.json', (j) {
+              j['id'] = 'squat$i';
+              j['interval_ms'] = 1000000000000;
+            })}\n',
+          );
+          await s.flush();
+          squatters.add(s);
+          await eventually(() => registry.hosts.containsKey('squat$i'));
+        }
+        expect(tcp.connections, lessThanOrEqualTo(kTcpMaxConnectionsPerIp));
+        expect(tcp.rejectedConnections, 32 - kTcpMaxConnectionsPerIp);
+        final real = await Socket.connect(loopback, tcp.boundPort!);
+        real.listen((_) {}, onError: (_) {});
+        real.write('${line('valid_full.json')}\n');
+        await real.flush();
+        await eventually(
+          () => registry.hosts.containsKey(
+            fixtureJson('valid_full.json')['id'] as String,
+          ),
+        );
+        expect(tcp.connections, lessThanOrEqualTo(kTcpMaxConnectionsPerIp));
+        for (final s in squatters) {
+          s.destroy();
+        }
+        real.destroy();
+      },
+    );
   });
 
   group('NetController', () {

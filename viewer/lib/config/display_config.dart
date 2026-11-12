@@ -1,10 +1,13 @@
 // Display + network settings, persisted in shared_preferences.
 // Agent viewer-core owns this file.
+import 'dart:collection';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart' show ThemeMode;
 import 'package:shared_preferences/shared_preferences.dart';
+
+import '../core/packet.dart' show isValidMetricKey;
 
 /// Per-slot look (used by [CardLayout.custom]). [barTile] is a dial-sized tile with the
 /// value above a horizontal bar.
@@ -80,6 +83,12 @@ const List<String> kDefaultSlotKeys = ['cpu', 'gpu', 'mem', 'disk'];
 
 const int kDefaultPort = 48000;
 
+/// Most metric slots kept. Keys first seen once the list is full get no slot.
+const int kMaxSlots = 64;
+
+/// Most entries kept in [DisplayConfig.hostOrder].
+const int kMaxHostOrder = 128;
+
 /// Stored-JSON flag: showDetails (card sparklines) was switched on once for configs
 /// saved before it defaulted to on.
 const String kSparklinesDefaultOnKey = 'sparklinesDefaultOnV3';
@@ -102,7 +111,11 @@ class DisplayConfig extends ChangeNotifier {
     _resetToDefaults();
   }
 
-  final List<MetricSlot> slots = [];
+  final List<MetricSlot> _slots = [];
+  final Map<String, MetricSlot> _slotIndex = {};
+
+  /// All slots in display order (read-only; use the methods below to change it).
+  late final List<MetricSlot> slots = UnmodifiableListView(_slots);
 
   bool _showDetails = true;
   ThemeMode _themeMode = ThemeMode.dark;
@@ -179,8 +192,10 @@ class DisplayConfig extends ChangeNotifier {
   /// Replaces the manual order (duplicates and empty ids dropped).
   void setHostOrder(List<String> ids) {
     final next = <String>[];
+    final seen = <String>{};
     for (final id in ids) {
-      if (id.isNotEmpty && !next.contains(id)) next.add(id);
+      if (next.length >= kMaxHostOrder) break;
+      if (id.isNotEmpty && seen.add(id)) next.add(id);
     }
     if (listEquals(next, _hostOrder)) return;
     _hostOrder
@@ -200,11 +215,15 @@ class DisplayConfig extends ChangeNotifier {
   /// Slots with visible == true, in display order.
   List<MetricSlot> get visibleSlots => slots.where((s) => s.visible).toList();
 
-  MetricSlot? slotFor(String key) {
-    for (final s in slots) {
-      if (s.key == key) return s;
-    }
-    return null;
+  MetricSlot? slotFor(String key) => _slotIndex[key];
+
+  void _replaceSlots(Iterable<MetricSlot> next) {
+    _slots
+      ..clear()
+      ..addAll(next);
+    _slotIndex
+      ..clear()
+      ..addEntries(_slots.map((s) => MapEntry(s.key, s)));
   }
 
   /// Loads from shared_preferences; defaults on first run or if the stored JSON is corrupt.
@@ -253,26 +272,39 @@ class DisplayConfig extends ChangeNotifier {
 
   /// Called by NetController with every key of an accepted packet. Appends a visible
   /// gauge slot for each key not in [slots] yet (whatever the unit), then notifies and
-  /// saves once for the whole batch; no-op when every key exists.
+  /// saves once for the whole batch; no-op when every key exists. Keys that are not
+  /// lowercase snake_case, and new keys once [kMaxSlots] slots exist, are ignored.
   void ensureSlots(Iterable<String> keys) {
     var added = false;
     for (final key in keys) {
-      if (slotFor(key) != null) continue;
-      slots.add(MetricSlot(key: key));
+      if (_slotIndex.containsKey(key) || !isValidMetricKey(key)) continue;
+      if (_slots.length >= kMaxSlots) break;
+      final slot = MetricSlot(key: key);
+      _slots.add(slot);
+      _slotIndex[key] = slot;
       added = true;
     }
     if (added) markChanged();
+  }
+
+  /// Deletes the slot for [key]. It comes back (as a new visible gauge) only if a
+  /// host sends that key again.
+  void removeSlot(String key) {
+    final s = _slotIndex.remove(key);
+    if (s == null) return;
+    _slots.remove(s);
+    markChanged();
   }
 
   /// Moves the slot at [oldIndex] so it ends up at [newIndex] in the resulting list.
   /// These are `ReorderableListView.onReorderItem` semantics (newIndex already adjusted
   /// for the removed item), NOT the deprecated `onReorder` ones. Indices are clamped.
   void reorder(int oldIndex, int newIndex) {
-    if (oldIndex < 0 || oldIndex >= slots.length) return;
-    final target = newIndex.clamp(0, slots.length - 1);
+    if (oldIndex < 0 || oldIndex >= _slots.length) return;
+    final target = newIndex.clamp(0, _slots.length - 1);
     if (target == oldIndex) return;
-    final slot = slots.removeAt(oldIndex);
-    slots.insert(target, slot);
+    final slot = _slots.removeAt(oldIndex);
+    _slots.insert(target, slot);
     markChanged();
   }
 
@@ -292,9 +324,7 @@ class DisplayConfig extends ChangeNotifier {
 
   /// Restores the default slot list (cpu/gpu/mem/disk gauges). Other settings unchanged.
   void resetSlots() {
-    slots
-      ..clear()
-      ..addAll(_defaultSlots());
+    _replaceSlots(_defaultSlots());
     markChanged();
   }
 
@@ -331,9 +361,7 @@ class DisplayConfig extends ChangeNotifier {
   ];
 
   void _resetToDefaults() {
-    slots
-      ..clear()
-      ..addAll(_defaultSlots());
+    _replaceSlots(_defaultSlots());
     _showDetails = true;
     _themeMode = ThemeMode.dark;
     _density = GridDensity.comfortable;
@@ -360,7 +388,18 @@ class DisplayConfig extends ChangeNotifier {
       final parsed = <MetricSlot>[];
       for (final e in rawSlots) {
         final s = MetricSlot.fromJson(e);
-        if (s != null && seen.add(s.key)) parsed.add(s);
+        // Sanitise configs polluted before keys were validated (<= 1.0.1): drop
+        // invalid keys, keep at most kMaxSlots, and save the cleaned list back.
+        if (s == null || !isValidMetricKey(s.key)) {
+          migrated = true;
+          continue;
+        }
+        if (!seen.add(s.key)) continue;
+        if (parsed.length >= kMaxSlots) {
+          migrated = true;
+          break;
+        }
+        parsed.add(s);
       }
       // v2: non-% metrics used to default to number tiles. Before the flag existed the
       // style could not be told apart from a user choice, so turn every number slot
@@ -371,9 +410,7 @@ class DisplayConfig extends ChangeNotifier {
         }
         migrated = true;
       }
-      slots
-        ..clear()
-        ..addAll(parsed);
+      _replaceSlots(parsed);
     }
     final showDetails = json['showDetails'];
     if (json[kSparklinesDefaultOnKey] == true) {
@@ -409,7 +446,13 @@ class DisplayConfig extends ChangeNotifier {
     if (order is List) {
       _hostOrder
         ..clear()
-        ..addAll(order.whereType<String>().where((s) => s.isNotEmpty).toSet());
+        ..addAll(
+          order
+              .whereType<String>()
+              .where((s) => s.isNotEmpty)
+              .toSet()
+              .take(kMaxHostOrder),
+        );
     }
     final smoothAnim = json['smoothAnimation'];
     if (smoothAnim is bool) _smoothAnimation = smoothAnim;

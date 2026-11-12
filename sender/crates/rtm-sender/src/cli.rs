@@ -33,9 +33,14 @@ pub struct Cli {
     #[arg(long)]
     pub no_broadcast: bool,
 
-    /// Print the effective configuration (file + flags) as TOML and exit.
+    /// Print the effective configuration (file + flags) as TOML and exit. The shared secret
+    /// is shown as "********" unless --show-secret is given too.
     #[arg(long)]
     pub print_config: bool,
+
+    /// With --print-config: print the shared secret itself.
+    #[arg(long, requires = "print_config")]
+    pub show_secret: bool,
 
     /// Sample once (two reads 200 ms apart), print the JSON packet to stdout, exit without sending.
     #[arg(long)]
@@ -80,6 +85,21 @@ impl Cli {
             _ => "trace",
         }
     }
+}
+
+/// The `--print-config` output: a `# <path>` line, then the TOML, with a non-empty
+/// `shared_secret` masked unless `show_secret`.
+pub fn render_config(
+    path: &std::path::Path,
+    cfg: &Config,
+    show_secret: bool,
+) -> anyhow::Result<String> {
+    let text = if show_secret {
+        cfg.to_toml_string()?
+    } else {
+        cfg.redacted().to_toml_string()?
+    };
+    Ok(format!("# {}\n{text}", path.display()))
 }
 
 /// "1000" | "1000ms" | "5s" -> milliseconds.
@@ -128,6 +148,7 @@ mod tests {
             "10.0.0.2:48001",
             "--no-broadcast",
             "--print-config",
+            "--show-secret",
             "--once",
             "--no-gui",
             "-vv",
@@ -136,7 +157,7 @@ mod tests {
         assert_eq!(c.interval, Some(5000));
         assert_eq!(c.udp_unicast.len(), 2);
         assert_eq!(c.tcp_unicast, vec!["10.0.0.2:48001".parse().unwrap()]);
-        assert!(c.no_broadcast && c.print_config && c.once && c.no_gui);
+        assert!(c.no_broadcast && c.print_config && c.show_secret && c.once && c.no_gui);
         assert_eq!(c.verbose, 2);
         assert_eq!(c.log_level(), "trace");
     }
@@ -150,6 +171,27 @@ mod tests {
         assert!(p(&["--udp-unicast", "nope"]));
         assert!(p(&["--tcp-unicast", "1.2.3.4"]));
         assert!(p(&["--bogus"]));
+        assert!(p(&["--show-secret"]), "only together with --print-config");
+    }
+
+    #[test]
+    fn print_config_masks_the_secret_unless_asked() {
+        let mut cfg = Config::default();
+        cfg.network.shared_secret = "hunter2".into();
+        let path = std::path::Path::new("x.toml");
+        let masked = render_config(path, &cfg, false).unwrap();
+        assert!(masked.starts_with("# x.toml\n"), "{masked}");
+        assert!(masked.contains("shared_secret = \"********\""), "{masked}");
+        assert!(!masked.contains("hunter2"));
+        let shown = render_config(path, &cfg, true).unwrap();
+        assert!(shown.contains("shared_secret = \"hunter2\""), "{shown}");
+        // Both parse back; the shown one is the config itself.
+        let body = |s: &str| s.split_once('\n').unwrap().1.to_string();
+        assert_eq!(Config::from_toml(&body(&shown)).unwrap(), cfg);
+        cfg.network.shared_secret.clear();
+        assert!(render_config(path, &cfg, false)
+            .unwrap()
+            .contains("shared_secret = \"\""));
     }
 
     #[test]

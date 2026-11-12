@@ -10,6 +10,88 @@ import 'package:crypto/crypto.dart';
 /// The only protocol version this viewer understands.
 const int kProtocolVersion = 1;
 
+/// Largest datagram / TCP line accepted, in bytes (UTF-8). Senders target <= 1400.
+/// Anything bigger is rejected before it is decoded.
+const int kMaxPacketBytes = 8 * 1024;
+
+/// Deepest JSON nesting accepted (the packet object itself is depth 1). Checked by a
+/// cheap bracket scan before `jsonDecode`, so deep junk costs linear time.
+const int kMaxJsonDepth = 16;
+
+/// Packets with more metrics than this are rejected outright.
+const int kMaxMetricsPerPacket = 32;
+
+/// Field length limits from protocol/schema/packet.schema.json, in Unicode code points.
+const int kMaxIdLength = 64;
+const int kMaxHostLength = 64;
+const int kMaxLabelLength = 12;
+const int kMaxUnitLength = 8;
+
+/// Metric keys the viewer accepts: lowercase snake_case, at most 32 characters. Other
+/// keys are dropped from the packet (the rest of the packet is kept).
+final RegExp kMetricKeyPattern = RegExp(r'^[a-z][a-z0-9_]{0,31}$');
+
+/// Whether [key] is an acceptable metric key ([kMetricKeyPattern]).
+bool isValidMetricKey(String key) => kMetricKeyPattern.hasMatch(key);
+
+/// [s] without C0/C1 control characters, DEL, and Unicode bidi embedding / override /
+/// isolate / mark characters, so sender-supplied text cannot reorder or hide what is
+/// shown around it.
+String sanitizeDisplayText(String s) {
+  var clean = true;
+  for (final c in s.runes) {
+    if (_isUnsafeRune(c)) {
+      clean = false;
+      break;
+    }
+  }
+  if (clean) return s;
+  final sb = StringBuffer();
+  for (final c in s.runes) {
+    if (!_isUnsafeRune(c)) sb.writeCharCode(c);
+  }
+  return sb.toString();
+}
+
+bool _isUnsafeRune(int c) =>
+    c < 0x20 ||
+    (c >= 0x7F && c <= 0x9F) ||
+    c == 0x061C ||
+    c == 0x200E ||
+    c == 0x200F ||
+    (c >= 0x202A && c <= 0x202E) ||
+    (c >= 0x2066 && c <= 0x2069);
+
+/// Whether the JSON text [text] nests objects/arrays deeper than [maxDepth]. Brackets
+/// inside strings are ignored. Linear, allocation-free; does not validate the JSON.
+bool jsonNestingExceeds(String text, int maxDepth) {
+  var depth = 0;
+  final n = text.length;
+  var i = 0;
+  while (i < n) {
+    final c = text.codeUnitAt(i);
+    if (c == 0x22) {
+      i++;
+      while (i < n) {
+        final d = text.codeUnitAt(i);
+        if (d == 0x5C) {
+          i += 2;
+        } else if (d == 0x22) {
+          break;
+        } else {
+          i++;
+        }
+      }
+    } else if (c == 0x7B || c == 0x5B) {
+      if (++depth > maxDepth) return true;
+    } else if (c == 0x7D || c == 0x5D) {
+      depth--;
+    }
+    i++;
+  }
+  return false;
+}
+
 /// Thrown when a packet is well-formed JSON but carries a protocol version other than
 /// [kProtocolVersion]. It is a [FormatException] whose message contains "version", so
 /// callers that only catch [FormatException] still work; callers that care can show the
@@ -106,7 +188,13 @@ class Packet {
     if (version is! num || version != kProtocolVersion) {
       throw UnsupportedVersionException(version);
     }
-    _rejectNonFinite(json, 'Packet');
+    final bad = _nonFinitePath(json);
+    if (bad != null) {
+      throw FormatException(
+        'Packet${bad.reversed.map((k) => ' field "$k"').join()} '
+        'contains a non-finite number',
+      );
+    }
     final metricsJson = json['metrics'];
     if (metricsJson == null) {
       throw const FormatException('Packet is missing required field "metrics"');
@@ -114,18 +202,28 @@ class Packet {
     if (metricsJson is! Map) {
       throw const FormatException('Packet field "metrics" must be an object');
     }
+    if (metricsJson.length > kMaxMetricsPerPacket) {
+      throw FormatException(
+        'Packet has ${metricsJson.length} metrics '
+        '(at most $kMaxMetricsPerPacket allowed)',
+      );
+    }
     final metrics = <String, Metric>{};
     metricsJson.forEach((key, value) {
+      // Keys outside lowercase snake_case are dropped, not fatal (see PROTOCOL.md).
+      if (key is! String || !isValidMetricKey(key)) return;
       if (value is! Map) {
         throw FormatException('Metric "$key" must be an object');
       }
-      metrics[key as String] = _metricFromJson(_stringMap(value), key);
+      metrics[key] = _metricFromJson(_stringMap(value), key);
     });
     final auth = json['auth'];
     return Packet(
       v: kProtocolVersion,
-      id: _reqString(json, 'id', 'Packet'),
-      host: _reqString(json, 'host', 'Packet'),
+      id: _reqString(json, 'id', 'Packet', maxLength: kMaxIdLength),
+      host: sanitizeDisplayText(
+        _reqString(json, 'host', 'Packet', maxLength: kMaxHostLength),
+      ),
       os: _reqString(json, 'os', 'Packet'),
       ts: _reqInt(json, 'ts'),
       seq: _reqInt(json, 'seq'),
@@ -136,8 +234,20 @@ class Packet {
     );
   }
 
-  /// Parses one UTF-8 JSON document (one UDP datagram or one TCP line).
+  /// Parses one UTF-8 JSON document (one UDP datagram or one TCP line). Rejects text
+  /// longer than [kMaxPacketBytes] code units or nested deeper than [kMaxJsonDepth]
+  /// before decoding it.
   static Packet parse(String text) {
+    if (text.length > kMaxPacketBytes) {
+      throw FormatException(
+        'Packet is larger than $kMaxPacketBytes bytes (${text.length})',
+      );
+    }
+    if (jsonNestingExceeds(text, kMaxJsonDepth)) {
+      throw const FormatException(
+        'Packet JSON is nested deeper than $kMaxJsonDepth levels',
+      );
+    }
     final Object? decoded;
     try {
       decoded = jsonDecode(text);
@@ -293,8 +403,12 @@ Metric _metricFromJson(Map<String, dynamic> json, String key) {
   final detail = json['detail'];
   return Metric(
     v: (v as num?)?.toDouble(),
-    unit: _reqString(json, 'unit', where),
-    label: _reqString(json, 'label', where),
+    unit: sanitizeDisplayText(
+      _reqString(json, 'unit', where, maxLength: kMaxUnitLength),
+    ),
+    label: sanitizeDisplayText(
+      _reqString(json, 'label', where, maxLength: kMaxLabelLength),
+    ),
     min: (min as num?)?.toDouble() ?? 0,
     max: (max as num?)?.toDouble(),
     // detail is optional and never needed to render; tolerate a non-object by dropping it.
@@ -304,31 +418,50 @@ Metric _metricFromJson(Map<String, dynamic> json, String key) {
   );
 }
 
-/// Throws [FormatException] if any number anywhere in [value] is NaN or infinite
-/// (`jsonDecode` turns an out-of-range literal like `1e400` into infinity). Such values
-/// cannot be rendered sensibly nor re-serialised for auth, so the whole packet is rejected.
-void _rejectNonFinite(Object? value, String where) {
-  if (value is double && !value.isFinite) {
-    throw FormatException('$where contains a non-finite number');
-  } else if (value is Map) {
-    value.forEach((k, v) => _rejectNonFinite(v, '$where field "$k"'));
+/// Finds a NaN or infinite number anywhere in [value] (`jsonDecode` turns an
+/// out-of-range literal like `1e400` into infinity). Such values cannot be rendered
+/// sensibly nor re-serialised for auth, so the whole packet is rejected. Returns the
+/// object keys leading to it, innermost first (built only on the way out, so a clean
+/// document costs no string work), or null when every number is finite.
+List<String>? _nonFinitePath(Object? value) {
+  if (value is double) return value.isFinite ? null : <String>[];
+  if (value is Map) {
+    for (final e in value.entries) {
+      final p = _nonFinitePath(e.value);
+      if (p != null) return p..add('${e.key}');
+    }
   } else if (value is List) {
     for (final e in value) {
-      _rejectNonFinite(e, where);
+      final p = _nonFinitePath(e);
+      if (p != null) return p;
     }
   }
+  return null;
 }
 
 Map<String, dynamic> _stringMap(Map m) =>
     m is Map<String, dynamic> ? m : m.map((k, v) => MapEntry(k.toString(), v));
 
-String _reqString(Map<String, dynamic> json, String field, String where) {
+String _reqString(
+  Map<String, dynamic> json,
+  String field,
+  String where, {
+  int? maxLength,
+}) {
   final value = json[field];
   if (value == null) {
     throw FormatException('$where is missing required field "$field"');
   }
   if (value is! String) {
     throw FormatException('$where field "$field" must be a string');
+  }
+  // Code units >= code points, so the cheap check first.
+  if (maxLength != null &&
+      value.length > maxLength &&
+      value.runes.length > maxLength) {
+    throw FormatException(
+      '$where field "$field" is longer than $maxLength characters',
+    );
   }
   return value;
 }

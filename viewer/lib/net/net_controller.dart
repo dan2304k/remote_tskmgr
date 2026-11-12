@@ -105,6 +105,10 @@ class NetController extends ChangeNotifier {
   /// [HostRegistry.droppedOutOfOrder]).
   int get droppedOutOfOrder => registry.droppedOutOfOrder;
 
+  /// New host ids ignored because the host list was full of live hosts (see
+  /// [HostRegistry.rejectedHosts]).
+  int get rejectedHosts => registry.rejectedHosts;
+
   /// Source of the last packet with an unsupported protocol version, for the
   /// "incompatible sender" hint; null if none seen.
   String? get lastIncompatibleSource => _intake.lastIncompatibleSource;
@@ -223,7 +227,7 @@ class NetController extends ChangeNotifier {
     final diag =
         '$_packetsPerSecond $hostCount ${_intake.errorCount} ${_intake.lastError} '
         '${_intake.lastErrorAge?.inSeconds} $_multicastLockHeld $_wifiLockHeld '
-        '${registry.droppedOutOfOrder}';
+        '${registry.droppedOutOfOrder} ${registry.rejectedHosts}';
     if (diag != _diagSnapshot) {
       _diagSnapshot = diag;
       _notify();

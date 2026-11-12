@@ -129,6 +129,8 @@ void main() {
     String signedWith(String literal, {int seq = 1}) {
       final j = fixtureJson('valid_full.json')..remove('auth');
       j['seq'] = seq;
+      // Signed packets must carry a current, increasing ts (replay protection).
+      j['ts'] = t.millisecondsSinceEpoch + seq;
       (j['metrics'] as Map)['cpu']['v'] = 12345.5;
       final body = Packet.canonicalBody(j).replaceFirst('12345.5', literal);
       final mac = Hmac(sha256, utf8.encode(key)).convert(utf8.encode(body));

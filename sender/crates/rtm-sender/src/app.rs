@@ -24,14 +24,33 @@ pub enum Control {
     Pause(bool),
 }
 
-/// The per-packet header fields that come from config.
-#[derive(Debug, Clone, PartialEq)]
+/// The per-packet header fields that come from config, plus `general.privacy`.
+/// `Debug` is written by hand so the secret never reaches a log line.
+#[derive(Clone, PartialEq)]
 pub struct Meta {
     pub id: String,
     pub host: String,
     pub os: String,
     pub interval_ms: u64,
     pub secret: Option<String>,
+    /// Replace device names in metric details (see `privacy`).
+    pub privacy: bool,
+}
+
+impl std::fmt::Debug for Meta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Meta")
+            .field("id", &self.id)
+            .field("host", &self.host)
+            .field("os", &self.os)
+            .field("interval_ms", &self.interval_ms)
+            .field(
+                "secret",
+                &self.secret.as_ref().map(|_| rtm_config::SECRET_MASK),
+            )
+            .field("privacy", &self.privacy)
+            .finish()
+    }
 }
 
 impl Meta {
@@ -42,13 +61,53 @@ impl Meta {
             os: std::env::consts::OS.to_string(),
             interval_ms: cfg.general.interval_ms,
             secret: cfg.secret().map(str::to_string),
+            privacy: cfg.general.privacy,
         }
     }
 }
 
-/// Assemble a packet; metrics keep their order. Signs when a secret is set. A packet that
-/// would exceed `PACKET_WARN_BYTES` loses `detail` objects, largest first, until it fits.
-pub fn build_packet(meta: &Meta, seq: u64, ts: u64, metrics: Vec<(String, Metric)>) -> Packet {
+/// Packet timestamps: wall-clock milliseconds, but strictly increasing. Viewers with a shared
+/// secret reject a `ts` that is not greater than the previous one from the same sender id, so
+/// a clock stepped backwards (NTP, manual change) or two packets in the same millisecond must
+/// still yield a larger value: `max(now, last + 1)`.
+pub struct TsClock {
+    now: Box<dyn FnMut() -> u64 + Send>,
+    last: Option<u64>,
+}
+
+impl TsClock {
+    /// The system clock (`rtm_protocol::now_ms`).
+    pub fn system() -> Self {
+        Self::with_clock(rtm_protocol::now_ms)
+    }
+
+    /// An injected clock (tests).
+    pub fn with_clock(now: impl FnMut() -> u64 + Send + 'static) -> Self {
+        Self {
+            now: Box::new(now),
+            last: None,
+        }
+    }
+
+    /// The `ts` for the next packet.
+    pub fn next(&mut self) -> u64 {
+        let now = (self.now)();
+        let ts = match self.last {
+            Some(last) => now.max(last.saturating_add(1)),
+            None => now,
+        };
+        self.last = Some(ts);
+        ts
+    }
+}
+
+/// Assemble a packet; metrics keep their order. With `meta.privacy` device names are replaced
+/// first. Signs when a secret is set. A packet that would exceed `PACKET_WARN_BYTES` loses
+/// `detail` objects, largest first, until it fits.
+pub fn build_packet(meta: &Meta, seq: u64, ts: u64, mut metrics: Vec<(String, Metric)>) -> Packet {
+    if meta.privacy {
+        crate::privacy::anonymise(&mut metrics);
+    }
     let mut p = Packet {
         v: PROTOCOL_VERSION,
         id: meta.id.clone(),
@@ -204,6 +263,7 @@ struct State {
     sender: Option<rtm_net::Sender>,
     last_sender_attempt: Instant,
     seq: u64,
+    ts: TsClock,
     last_sample: Instant,
     warned_size: bool,
     send_ok: bool,
@@ -232,6 +292,7 @@ impl State {
             collectors,
             cfg,
             seq: 0,
+            ts: TsClock::system(),
             last_sample: Instant::now(),
             warned_size: false,
             send_ok: true,
@@ -312,7 +373,7 @@ impl State {
             // not advance and the first packet after resuming follows the last one sent.
             return;
         }
-        let packet = build_packet(&self.meta, self.seq, rtm_protocol::now_ms(), metrics);
+        let packet = build_packet(&self.meta, self.seq, self.ts.next(), metrics);
         self.seq += 1;
 
         if self.sender.is_none()
@@ -434,6 +495,7 @@ mod tests {
             os: "linux".into(),
             interval_ms: 1000,
             secret: secret.map(str::to_string),
+            privacy: false,
         }
     }
 
@@ -663,6 +725,89 @@ mod tests {
         cfg.metrics.enabled = vec!["mem".into()];
         cfg.validate().unwrap();
         cfg
+    }
+
+    #[test]
+    fn ts_is_strictly_increasing_even_when_the_clock_steps_back() {
+        let script = [1000u64, 1000, 1000, 1500, 900, 0, 1499, 1503, 1503, 5000];
+        let mut i = 0;
+        let mut c = TsClock::with_clock(move || {
+            i += 1;
+            script[i - 1]
+        });
+        let got: Vec<u64> = (0..script.len()).map(|_| c.next()).collect();
+        assert_eq!(
+            got,
+            [1000, 1001, 1002, 1500, 1501, 1502, 1503, 1504, 1505, 5000]
+        );
+        assert!(got.windows(2).all(|w| w[0] < w[1]));
+        // No overflow at the top of the range.
+        let mut c = TsClock::with_clock(|| u64::MAX);
+        assert_eq!((c.next(), c.next()), (u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn loop_packets_use_the_monotonic_clock() {
+        let mut st = State::new(quiet_cfg()).unwrap();
+        // Every tick in the same millisecond, then a step back by an hour.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let n = calls.clone();
+        st.ts = TsClock::with_clock(move || {
+            match n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0..=2 => 10_000_000,
+                _ => 10_000_000 - 3_600_000,
+            }
+        });
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            st.tick();
+            seen.push(st.ts.last.unwrap());
+        }
+        assert_eq!(seen, (10_000_000..10_000_005).collect::<Vec<_>>());
+        st.paused = true;
+        st.tick();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "paused: no ts taken"
+        );
+    }
+
+    #[test]
+    fn meta_debug_hides_the_secret() {
+        let s = format!("{:?}", meta(Some("hunter2")));
+        assert!(!s.contains("hunter2") && s.contains("********"), "{s}");
+        assert!(format!("{:?}", meta(None)).contains("secret: None"));
+    }
+
+    #[test]
+    fn privacy_applies_to_built_packets() {
+        use rtm_protocol::serde_json::json;
+        let gpu = || {
+            Metric::percent("GPU", Some(1.0)).with_detail(
+                json!({"name": "NVIDIA GeForce RTX 4090", "adapter_index": 0})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+        };
+        let mut m = meta(Some("k"));
+        let p = build_packet(&m, 1, 1, vec![("gpu".into(), gpu())]);
+        assert_eq!(
+            p.metrics["gpu"]["detail"]["name"], "NVIDIA GeForce RTX 4090",
+            "off by default"
+        );
+        m.privacy = true;
+        let p = build_packet(&m, 1, 1, vec![("gpu".into(), gpu())]);
+        assert_eq!(p.metrics["gpu"]["detail"]["name"], "GPU #0");
+        assert!(p.verify("k"), "signed after the transformation");
+        let mut c = Config::default();
+        c.general.privacy = true;
+        assert!(Meta::from_config(&c).privacy);
+        assert!(
+            diff(&Config::default(), &c).meta,
+            "toggling privacy applies on reload"
+        );
     }
 
     #[test]

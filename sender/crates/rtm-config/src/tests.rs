@@ -478,3 +478,141 @@ fn empty_host_name_falls_back_to_system() {
 fn secret_empty_is_none() {
     assert_eq!(Config::default().secret(), None);
 }
+
+#[cfg(unix)]
+fn mode_of(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+fn set_mode(p: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// The file and the directories the sender creates are private whatever the umask: the
+/// assertions are on the mode bits, so a permissive umask (022, 002) would fail them
+/// without the explicit modes.
+#[cfg(unix)]
+#[test]
+fn created_config_and_dirs_are_private() {
+    let p = tmp_path("sender.toml");
+    Config::load_or_create(&p).unwrap();
+    assert_eq!(mode_of(&p) & 0o077, 0, "file mode {:o}", mode_of(&p));
+    let sub = p.parent().unwrap();
+    assert_eq!(mode_of(sub) & 0o077, 0, "dir mode {:o}", mode_of(sub));
+    assert_eq!(
+        mode_of(sub.parent().unwrap()) & 0o077,
+        0,
+        "parent created too"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn save_keeps_the_file_private_and_leaves_an_existing_dir_alone() {
+    let p = tmp_path("sender.toml");
+    let dir = p.parent().unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    set_mode(dir, 0o755);
+    std::fs::write(&p, "[general]\nid = \"x\"\n").unwrap();
+    set_mode(&p, 0o644);
+    let mut c = Config::load(&p).unwrap();
+    c.network.shared_secret = "k".into();
+    c.save(&p).unwrap();
+    assert_eq!(mode_of(&p) & 0o077, 0, "rename replaced the 644 file");
+    assert_eq!(mode_of(dir), 0o755, "pre-existing dir not chmod-ed");
+}
+
+#[cfg(unix)]
+#[test]
+fn load_tightens_a_readable_file_only_when_it_holds_a_secret() {
+    let p = tmp_path("sender.toml");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(
+        &p,
+        "[general]\nid = \"x\"\n[network]\nshared_secret = \"\"\n",
+    )
+    .unwrap();
+    set_mode(&p, 0o644);
+    Config::load_or_create(&p).unwrap();
+    assert_eq!(mode_of(&p), 0o644, "no secret: left alone");
+
+    std::fs::write(
+        &p,
+        "[general]\nid = \"x\"\n[network]\nshared_secret = \"k\"\n",
+    )
+    .unwrap();
+    set_mode(&p, 0o640);
+    assert_eq!(Config::load_or_create(&p).unwrap().secret(), Some("k"));
+    assert_eq!(mode_of(&p), 0o600);
+
+    // Already private (or stricter): untouched.
+    set_mode(&p, 0o400);
+    Config::load_or_create(&p).unwrap();
+    assert_eq!(mode_of(&p), 0o400);
+}
+
+#[cfg(unix)]
+#[test]
+fn private_open_options_create_mode_600() {
+    let p = tmp_path("x.lock");
+    create_private_dir(p.parent().unwrap()).unwrap();
+    private_open_options()
+        .create(true)
+        .append(true)
+        .open(&p)
+        .unwrap();
+    assert_eq!(mode_of(&p) & 0o077, 0);
+}
+
+#[test]
+fn debug_output_redacts_the_secret() {
+    let mut c = Config::default();
+    c.network.shared_secret = "hunter2-very-secret".into();
+    for s in [
+        format!("{c:?}"),
+        format!("{c:#?}"),
+        format!("{:?}", c.network),
+    ] {
+        assert!(!s.contains("hunter2"), "{s}");
+        assert!(s.contains("shared_secret: \"********\""), "{s}");
+        assert!(
+            s.contains("udp_port: 48000"),
+            "other fields still shown: {s}"
+        );
+    }
+    c.network.shared_secret.clear();
+    assert!(format!("{c:?}").contains("shared_secret: \"\""));
+}
+
+#[test]
+fn redacted_copy_masks_a_non_empty_secret() {
+    let mut c = Config::default();
+    assert_eq!(c.redacted(), c, "empty secret shown as empty");
+    c.network.shared_secret = "hunter2".into();
+    let r = c.redacted();
+    assert_eq!(r.network.shared_secret, SECRET_MASK);
+    let text = r.to_toml_string().unwrap();
+    assert!(text.contains("shared_secret = \"********\"") && !text.contains("hunter2"));
+    assert_eq!(c.network.shared_secret, "hunter2", "original untouched");
+}
+
+#[test]
+fn parse_errors_do_not_quote_the_secret() {
+    let err = Config::from_toml("[network]\nshared_secret = \"hunter2\n").unwrap_err();
+    let s = err.to_string();
+    assert!(!s.contains("hunter2"), "{s}");
+    assert!(s.contains("shared_secret = ********"), "{s}");
+    let err = Config::from_toml("[network]\nshared_secret = hunter2\n").unwrap_err();
+    assert!(!err.to_string().contains("hunter2"), "{err}");
+}
+
+#[test]
+fn privacy_defaults_off_and_parses() {
+    assert!(!Config::default().general.privacy);
+    let c = Config::from_toml("[general]\nprivacy = true\n").unwrap();
+    assert!(c.general.privacy);
+    assert!(default_template("x").contains("privacy = false"));
+}

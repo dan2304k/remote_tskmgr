@@ -2,7 +2,7 @@
 //! `--print-config`) also to `sender.log` next to the config file, because a Windows GUI
 //! build has no visible stderr and a tray app started at login has no terminal.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,15 +20,18 @@ pub fn log_path(config: &Path) -> PathBuf {
 }
 
 /// Open `path` for appending, creating it and its directory. A file over `max` bytes is
-/// truncated first.
+/// truncated first. On Unix a new file gets mode 0600 and a new directory 0700.
 pub fn open_log(path: &Path, max: u64) -> io::Result<File> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)?;
+        rtm_config::create_private_dir(dir)?;
     }
     if std::fs::metadata(path).is_ok_and(|m| m.len() > max) {
         File::create(path)?;
     }
-    OpenOptions::new().create(true).append(true).open(path)
+    rtm_config::private_open_options()
+        .create(true)
+        .append(true)
+        .open(path)
 }
 
 /// Install the global subscriber: `RTM_LOG` or `default_level`, to stderr and, if given, to
@@ -93,5 +96,17 @@ mod tests {
         std::fs::write(&p, vec![b'x'; 100]).unwrap();
         open_log(&p, 100).unwrap().write_all(b"!").unwrap();
         assert_eq!(std::fs::metadata(&p).unwrap().len(), 101);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_log_file_and_dir_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("new").join(LOG_FILE);
+        open_log(&p, 100).unwrap();
+        assert_eq!(mode(&p) & 0o077, 0, "log mode {:o}", mode(&p));
+        assert_eq!(mode(p.parent().unwrap()) & 0o077, 0);
     }
 }

@@ -30,6 +30,9 @@ pub struct General {
     pub interval_ms: u64,
     /// "auto" = generate a UUID v4 once and persist it back into the file.
     pub id: String,
+    /// Leave device-identifying names out of packets: GPU adapter names become "GPU #N",
+    /// disk names "disk0".., sensor names "sensor0..". Values and per-core arrays are kept.
+    pub privacy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -40,7 +43,8 @@ pub enum BroadcastInterfaces {
     Named(Vec<String>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// `Debug` is written by hand so that `shared_secret` never reaches a log line.
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Network {
     pub udp_broadcast: bool,
@@ -78,6 +82,7 @@ impl Default for General {
             host_name: String::new(),
             interval_ms: 1000,
             id: "auto".into(),
+            privacy: false,
         }
     }
 }
@@ -97,6 +102,28 @@ impl Default for Network {
         }
     }
 }
+/// What `Debug` and `--print-config` show instead of a non-empty secret.
+pub const SECRET_MASK: &str = "********";
+
+impl std::fmt::Debug for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secret = if self.shared_secret.is_empty() {
+            ""
+        } else {
+            SECRET_MASK
+        };
+        f.debug_struct("Network")
+            .field("udp_broadcast", &self.udp_broadcast)
+            .field("udp_port", &self.udp_port)
+            .field("broadcast_interfaces", &self.broadcast_interfaces)
+            .field("skip_interface_prefixes", &self.skip_interface_prefixes)
+            .field("udp_unicast", &self.udp_unicast)
+            .field("tcp_unicast", &self.tcp_unicast)
+            .field("shared_secret", &secret)
+            .finish()
+    }
+}
+
 impl Default for Metrics {
     fn default() -> Self {
         Self {
@@ -124,7 +151,8 @@ impl Default for Gui {
 pub enum ConfigError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("parse: {0}")]
+    /// Displayed with the value of any `shared_secret` line in the quoted source masked.
+    #[error("parse: {}", redact_secret_lines(&.0.to_string()))]
     Parse(#[from] toml::de::Error),
     #[error("serialise: {0}")]
     Ser(#[from] toml::ser::Error),
@@ -152,6 +180,15 @@ impl Config {
         Self::from_toml(&std::fs::read_to_string(path)?)
     }
 
+    /// A copy for display (`--print-config`): a non-empty secret becomes `SECRET_MASK`.
+    pub fn redacted(&self) -> Config {
+        let mut c = self.clone();
+        if !c.network.shared_secret.is_empty() {
+            c.network.shared_secret = SECRET_MASK.into();
+        }
+        c
+    }
+
     /// Load, or write defaults (with comments) and return them. Resolves `id = "auto"` (or an
     /// empty or missing id) to a UUID v4 and persists it back to the file, keeping the user's
     /// comments: the `id` line is replaced, or inserted under `[general]` when there is none.
@@ -165,6 +202,9 @@ impl Config {
         }
         let text = std::fs::read_to_string(path)?;
         let mut cfg = Self::from_toml(&text)?;
+        if cfg.secret().is_some() {
+            tighten_permissions(path);
+        }
         if cfg.id_is_auto() {
             cfg.general.id = uuid::Uuid::new_v4().to_string();
             let edited = replace_id_line(&text, &cfg.general.id)
@@ -182,6 +222,7 @@ impl Config {
     }
 
     /// Write pretty TOML atomically (temp file + rename). Comments in an existing file are lost.
+    /// On Unix the file is written with mode 0600 (it may hold the shared secret).
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         write_atomic(path, &toml::to_string_pretty(self)?)
     }
@@ -582,6 +623,79 @@ fn insert_id_line(text: &str, id: &str) -> Option<String> {
     }
 }
 
+/// Create `dir` and any missing parents. On Unix the directories created here get mode 0700
+/// (the config dir holds the shared secret and the log); directories that already exist are
+/// left alone. On Windows this is `create_dir_all` (the profile ACLs already restrict it).
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// `OpenOptions` that create a new file readable by its owner only (mode 0600 on Unix; no
+/// change on Windows).
+pub fn private_open_options() -> std::fs::OpenOptions {
+    #[allow(unused_mut)]
+    let mut o = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o
+}
+
+/// Unix: a config file holding a secret that group or others can read is set to 0600 (one
+/// info line). Best effort: a failure (e.g. not the owner) is a warning. No-op on Windows.
+fn tighten_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::metadata(path) else {
+            return;
+        };
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 == 0 {
+            return;
+        }
+        match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => tracing::info!(
+                path = %path.display(),
+                "config holds shared_secret but was readable by others (mode {mode:03o}); set to 600"
+            ),
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                "config holds shared_secret and is readable by others (mode {mode:03o}); cannot chmod 600: {e}"
+            ),
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Mask the value on every line that mentions `shared_secret` (TOML parse errors quote the
+/// offending source line).
+fn redact_secret_lines(s: &str) -> String {
+    s.split_inclusive('\n')
+        .map(|line| match line.find("shared_secret") {
+            Some(i) => {
+                let nl = &line[line.trim_end_matches(['\r', '\n']).len()..];
+                format!("{}shared_secret = {SECRET_MASK}{nl}", &line[..i])
+            }
+            None => line.to_string(),
+        })
+        .collect()
+}
+
 /// Write `contents` to a uniquely named temp file next to `path`, fsync it, then rename it
 /// over `path`. Concurrent writers (tray and settings window, two processes) never share a
 /// temp file, and a crash leaves either the old or the new file, never a truncated one.
@@ -592,7 +706,7 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), ConfigError> {
 
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
     if let Some(dir) = dir {
-        std::fs::create_dir_all(dir)?;
+        create_private_dir(dir)?;
     }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
     let nanos = std::time::SystemTime::now()
@@ -610,7 +724,9 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), ConfigError> {
         None => PathBuf::from(tmp_name),
     };
     let result = (|| -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new()
+        // 0600 on Unix: the file holds the shared secret, and the rename replaces any mode
+        // the user set on the old file.
+        let mut f = private_open_options()
             .write(true)
             .create_new(true)
             .open(&tmp)?;
@@ -641,6 +757,7 @@ pub fn default_template(id: &str) -> String {
 host_name = ""            # empty = system hostname
 interval_ms = 1000        # 100 | 200 | 1000 | 5000 | 15000 | 30000 (any value 100..=3600000 accepted)
 id = "{id}"   # stable per-install id; "auto" = generate once and persist
+privacy = false           # true = no GPU / disk / sensor names in packets ("GPU #0", "disk0", ...)
 
 [network]
 udp_broadcast = true

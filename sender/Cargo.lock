@@ -2860,7 +2860,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "rtm-collect"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "nvml-wrapper",
  "rtm-protocol",
@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "rtm-config"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "directories",
  "hostname",
@@ -2889,7 +2889,7 @@ dependencies = [
 
 [[package]]
 name = "rtm-net"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "crossbeam-channel",
  "if-addrs",
@@ -2902,7 +2902,7 @@ dependencies = [
 
 [[package]]
 name = "rtm-protocol"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hex",
  "hmac",
@@ -2914,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "rtm-sender"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "clap",

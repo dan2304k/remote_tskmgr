@@ -25,10 +25,13 @@ pub enum IfaceMode {
 }
 
 /// Editable copy of `Config`. Lists are edited as rows of text; empty rows are dropped on Save.
-#[derive(Debug, Clone, PartialEq)]
+/// `Debug` is written by hand so the shared secret is never printed.
+#[derive(Clone, PartialEq)]
 pub struct Form {
     pub host_name: String,
     pub interval_ms: u64,
+    /// `general.privacy`: "Hide device names in packets".
+    pub privacy: bool,
     pub udp_broadcast: bool,
     pub udp_port: String,
     pub iface_mode: IfaceMode,
@@ -48,6 +51,37 @@ pub struct Form {
     pub autostart: bool,
     /// The config the form was made from; carries fields the form does not edit (`id`).
     base: Config,
+}
+
+impl std::fmt::Debug for Form {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secret = if self.shared_secret.is_empty() {
+            ""
+        } else {
+            rtm_config::SECRET_MASK
+        };
+        f.debug_struct("Form")
+            .field("host_name", &self.host_name)
+            .field("interval_ms", &self.interval_ms)
+            .field("privacy", &self.privacy)
+            .field("udp_broadcast", &self.udp_broadcast)
+            .field("udp_port", &self.udp_port)
+            .field("iface_mode", &self.iface_mode)
+            .field("iface_names", &self.iface_names)
+            .field("skip_prefixes", &self.skip_prefixes)
+            .field("udp_unicast", &self.udp_unicast)
+            .field("tcp_unicast", &self.tcp_unicast)
+            .field("shared_secret", &secret)
+            .field("metrics", &self.metrics)
+            .field("gpu_backend", &self.gpu_backend)
+            .field("gpu_adapter", &self.gpu_adapter)
+            .field("disk_include", &self.disk_include)
+            .field("start_minimized", &self.start_minimized)
+            .field("show_splash", &self.show_splash)
+            .field("autostart", &self.autostart)
+            .field("base", &self.base) // Config's Debug masks the secret too
+            .finish()
+    }
 }
 
 /// Port used for unicast rows without one when the port field is not a valid number.
@@ -193,6 +227,7 @@ impl Form {
         Self {
             host_name: c.general.host_name.clone(),
             interval_ms: c.general.interval_ms,
+            privacy: c.general.privacy,
             udp_broadcast: c.network.udp_broadcast,
             udp_port: c.network.udp_port.to_string(),
             iface_mode,
@@ -228,6 +263,7 @@ impl Form {
         let mut c = self.base.clone();
         c.general.host_name = self.host_name.trim().to_string();
         c.general.interval_ms = self.interval_ms;
+        c.general.privacy = self.privacy;
         if self.interval_ms < MIN_INTERVAL_MS {
             errs.push(format!("interval must be at least {MIN_INTERVAL_MS} ms"));
         }
@@ -537,6 +573,11 @@ fn form_ui(ui: &mut egui::Ui, f: &mut Form, show_secret: &mut bool, adapters: &[
         });
         ui.end_row();
     });
+    ui.checkbox(&mut f.privacy, "Hide device names in packets")
+        .on_hover_text(
+            "Viewers see \"GPU #0\", \"disk0\", \"sensor0\" instead of adapter, disk and sensor names. \
+             Values are unchanged.",
+        );
 
     ui.separator();
     ui.heading("Network");
@@ -804,6 +845,7 @@ mod tests {
         c.general.id = "fixed-id".into();
         c.general.host_name = "desk".into();
         c.general.interval_ms = 5000;
+        c.general.privacy = true;
         c.network.udp_broadcast = false;
         c.network.udp_port = 48123;
         c.network.broadcast_interfaces = BroadcastInterfaces::Named(vec!["eth0".into()]);
@@ -818,6 +860,18 @@ mod tests {
         c.gui.show_splash = false;
         c.gui.autostart = true;
         c
+    }
+
+    #[test]
+    fn form_debug_hides_the_secret() {
+        let f = Form::from_config(&custom());
+        assert!(f.privacy);
+        let s = format!("{f:?}");
+        assert!(!s.contains("s3cret"), "{s}");
+        assert!(
+            s.contains("********") && s.contains("host_name: \"desk\""),
+            "{s}"
+        );
     }
 
     #[test]

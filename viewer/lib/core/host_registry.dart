@@ -41,6 +41,22 @@ const int kMetricPruneWindows = 10;
 /// Hosts offline for longer than this are removed automatically.
 const Duration kAutoRemoveOfflineAfter = Duration(hours: 24);
 
+/// Bounds for the sender-claimed `interval_ms` wherever the viewer derives a timing
+/// from it (staleness, offline, metric window, smoothing, TCP idle timeout). A bogus
+/// huge value would otherwise keep a spoofed host "live" for ever.
+const int kMinIntervalMs = 100;
+const int kMaxIntervalMs = 60000;
+
+/// [intervalMs] clamped to [kMinIntervalMs]..[kMaxIntervalMs].
+int clampIntervalMs(int intervalMs) =>
+    intervalMs.clamp(kMinIntervalMs, kMaxIntervalMs);
+
+/// Most hosts tracked at once; see [HostRegistry.ingest] for what happens when full.
+const int kMaxHosts = 64;
+
+/// Most metric keys with history kept per host.
+const int kMaxMetricKeysPerHost = 32;
+
 /// Fixed-capacity ring of recent samples for sparklines. Oldest first in [values].
 class RingBuffer {
   RingBuffer(this.capacity);
@@ -122,9 +138,10 @@ class HostState {
   /// Display name from the latest packet.
   String get host => latest.host;
 
-  /// The sender's current interval, clamped to at least 100 ms against bogus values.
+  /// The sender's current interval, clamped to [kMinIntervalMs]..[kMaxIntervalMs]
+  /// against bogus values.
   Duration get interval =>
-      Duration(milliseconds: latest.intervalMs < 100 ? 100 : latest.intervalMs);
+      Duration(milliseconds: clampIntervalMs(latest.intervalMs));
 
   /// No packet for this long -> stale: 3 x interval, but never under [kMinStaleAfter] so
   /// that fast senders (100-200 ms) do not flicker to stale on ordinary Wi-Fi jitter.
@@ -185,6 +202,10 @@ class HostRegistry extends ChangeNotifier {
   /// Packets dropped as duplicates / out of order since start (diagnostics).
   int droppedOutOfOrder = 0;
 
+  /// Packets from new host ids ignored because [kMaxHosts] live hosts were already
+  /// tracked (diagnostics).
+  int rejectedHosts = 0;
+
   /// Hosts in a stable order: live first, then stale, then offline; ties by host name.
   List<HostState> get ordered {
     final list = hosts.values.toList();
@@ -216,6 +237,10 @@ class HostRegistry extends ChangeNotifier {
     final HostState state;
     var structural = false;
     if (existing == null) {
+      if (hosts.length >= kMaxHosts && !_evictOneNonLive(now)) {
+        rejectedHosts++;
+        return false;
+      }
       state = HostState(id: p.id, latest: p, lastSeen: now);
       hosts[p.id] = state;
       structural = true;
@@ -236,6 +261,10 @@ class HostRegistry extends ChangeNotifier {
     state.status = HostStatus.live;
     state.lastSource = source;
     p.metrics.forEach((key, m) {
+      if (!state.metricLastSeen.containsKey(key) &&
+          state.metricLastSeen.length >= kMaxMetricKeysPerHost) {
+        _evictOldestKey(state, p.metrics);
+      }
       state.history.putIfAbsent(key, () => RingBuffer(kHistoryLength)).add(m.v);
       state.metricLastSeen[key] = now;
     });
@@ -248,6 +277,37 @@ class HostRegistry extends ChangeNotifier {
     return true;
   }
 
+  /// Drops the non-live host heard from longest ago to make room. Returns false when
+  /// every host is live.
+  bool _evictOneNonLive(DateTime now) {
+    HostState? oldest;
+    for (final h in hosts.values) {
+      if (h.statusAt(now) == HostStatus.live) continue;
+      if (oldest == null || h.lastSeen.isBefore(oldest.lastSeen)) oldest = h;
+    }
+    if (oldest == null) return false;
+    hosts.remove(oldest.id);
+    return true;
+  }
+
+  /// Frees one of [state]'s [kMaxMetricKeysPerHost] key slots: the key seen longest
+  /// ago that is not in [current].
+  static void _evictOldestKey(HostState state, Map<String, Metric> current) {
+    String? oldest;
+    DateTime? at;
+    for (final e in state.metricLastSeen.entries) {
+      if (current.containsKey(e.key)) continue;
+      if (at == null || e.value.isBefore(at)) {
+        oldest = e.key;
+        at = e.value;
+      }
+    }
+    if (oldest == null) return;
+    state.metricLastSeen.remove(oldest);
+    state.history.remove(oldest);
+  }
+
+  /// Removes any host, live or not. A live host reappears with its next packet.
   void remove(String id) {
     if (hosts.remove(id) != null) notifyListeners();
   }
