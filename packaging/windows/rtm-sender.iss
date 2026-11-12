@@ -80,8 +80,8 @@ const
   RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
 
 { The tray's "Start at login" checkbox writes HKCU\...\Run\rtm-sender on its own, so the
-  [Registry] uninsdeletevalue entry (only present when the task was ticked) is not enough:
-  remove the value unconditionally. }
+  uninsdeletevalue flag in the Registry section (only present when the task was ticked) is
+  not enough: remove the value unconditionally. }
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
