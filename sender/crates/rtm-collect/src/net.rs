@@ -13,20 +13,16 @@ use std::time::Duration;
 use sysinfo::Networks;
 
 /// Loopback (always; sysinfo has no loopback flag, so by name) or a name matched by one of
-/// `prefixes`, with the same rule as `rtm_net::iface::skipped_by_prefix`: case-sensitive, and
-/// the name must equal the prefix or continue with something other than an ASCII lowercase
-/// letter (`lo` matches `lo0`, not "Local Area Connection").
+/// `prefixes`, with the same rule as `rtm_net::iface::skipped_by_prefix`: a plain
+/// case-sensitive prefix match (`br-` matches `br-d902...`, `lo` does not match
+/// "Local Area Connection").
 pub(crate) fn skip_interface(name: &str, prefixes: &[String]) -> bool {
-    name == "lo" || name.to_ascii_lowercase().contains("loopback") || {
-        prefixes.iter().map(|p| p.trim()).any(|p| {
-            !p.is_empty()
-                && name.starts_with(p)
-                && !name[p.len()..]
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_lowercase())
-        })
-    }
+    name == "lo"
+        || name.to_ascii_lowercase().contains("loopback")
+        || prefixes
+            .iter()
+            .map(|p| p.trim())
+            .any(|p| !p.is_empty() && name.starts_with(p))
 }
 
 pub struct NetCollector {
@@ -125,15 +121,10 @@ mod tests {
         for n in ["enp0s31f6", "wlan0", "eth0", "Ethernet"] {
             assert!(!skip_interface(n, &skip), "{n}");
         }
-        for n in ["lo0", "br-1ee4"] {
+        for n in ["lo0", "br-1ee4", "br-d902716df028", "vetha1b2c3d"] {
             assert!(skip_interface(n, &skip), "{n}");
         }
-        for n in [
-            "Local Area Connection",
-            "local0",
-            "vEthernet (External)",
-            "Docker1",
-        ] {
+        for n in ["Local Area Connection", "vEthernet (External)", "Docker1"] {
             assert!(!skip_interface(n, &skip), "{n}");
         }
         // Configured prefixes are case-sensitive; loopback is skipped even with an empty list.

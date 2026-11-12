@@ -61,20 +61,15 @@ pub fn default_route_ip() -> Option<Ipv4Addr> {
     }
 }
 
-/// Does `name` start with one of `prefixes` (case-sensitive; empty prefixes ignored)? The
-/// name must equal the prefix or continue with something other than an ASCII lowercase
-/// letter, so `lo` matches `lo` / `lo0` but not `local`, and `docker` matches `docker0`.
-/// Windows names such as "Local Area Connection" or "vEthernet (External)" (which can be the
-/// main NIC) are never caught by the default list.
+/// Does `name` start with one of `prefixes`? Plain case-sensitive prefix match; empty
+/// prefixes are ignored. `br-` matches `br-d902...`, `veth` matches `vetha1b2c3d`, `docker`
+/// matches `docker0`. Case-sensitivity keeps Windows names such as "Local Area Connection"
+/// or "vEthernet (External)" (which can be the main NIC) clear of the default list.
 pub fn skipped_by_prefix(name: &str, prefixes: &[String]) -> bool {
-    prefixes.iter().map(|p| p.trim()).any(|p| {
-        !p.is_empty()
-            && name.starts_with(p)
-            && !name[p.len()..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_lowercase())
-    })
+    prefixes
+        .iter()
+        .map(|p| p.trim())
+        .any(|p| !p.is_empty() && name.starts_with(p))
 }
 
 /// Pick directed-broadcast destinations.
@@ -227,14 +222,21 @@ mod tests {
 
     #[test]
     fn skip_prefix_matching() {
-        for n in ["lo", "lo0", "docker0", "br-1ee4", "veth12ab", "virbr0"] {
+        for n in [
+            "lo",
+            "lo0",
+            "docker0",
+            "br-1ee4",
+            "br-d902716df028",
+            "veth12ab",
+            "vetha1b2c3d",
+            "virbr0",
+        ] {
             assert!(skipped_by_prefix(n, &skip()), "{n}");
         }
         for n in [
             "Local Area Connection",
-            "local0",
             "vEthernet (External)",
-            "vethernet",
             "enp0s31f6",
             "Ethernet",
             "Docker1",
