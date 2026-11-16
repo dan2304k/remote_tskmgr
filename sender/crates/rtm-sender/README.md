@@ -166,7 +166,7 @@ Startup (start minimized, show a splash on start, start at login).
 * **Close**, or the window's close button, hides the settings window; the sender keeps running
   in the tray.
 * The bottom panel is read-only: where packets go, last packet size and sequence number,
-  packets per second, last send error.
+  packets per second, last send error, and the sender version.
 
 `gui.start_minimized = true` (the default) starts with only the tray icon. Set it to `false`
 to open the settings window at launch.

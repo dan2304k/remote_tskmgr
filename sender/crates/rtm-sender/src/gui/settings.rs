@@ -551,6 +551,7 @@ fn status_panel(ui: &mut egui::Ui, s: &Status, pps: Option<f64>) {
             egui::RichText::new(e).color(ui.visuals().error_fg_color),
         );
     }
+    row(ui, "Version", env!("CARGO_PKG_VERSION").into());
 }
 
 fn form_ui(ui: &mut egui::Ui, f: &mut Form, show_secret: &mut bool, adapters: &[Adapter]) {
