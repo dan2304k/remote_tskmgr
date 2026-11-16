@@ -185,6 +185,8 @@ mod tests {
         assert!(b.due(t), "a fast read ends the back-off");
     }
 
+    // PCI addresses contain colons, which Windows does not allow in file names.
+    #[cfg(unix)]
     #[test]
     fn runtime_power_state() {
         let t = tempfile::tempdir().unwrap();
