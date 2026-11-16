@@ -259,6 +259,12 @@ heuristic).
   queries in a row give an empty value.
 * **AMD on Linux (`amdgpu`):** `gpu_busy_percent` of the chosen card, which includes compute.
   `detail.adapters` gives every card's `busy`, `vram_used_mb` and `vram_total_mb`.
+* **Linux hybrid laptops (`amdgpu` and `nvml`):** a discrete GPU that powers down when idle
+  is not read while its `power/runtime_status` in sysfs says `suspended`, because reading
+  it would wake it. It reports 0 with `detail.state = "asleep"`. Once such a GPU has been
+  read idle it is left alone for 10 s, so that polling does not keep it awake; load that
+  starts in that window shows up to 10 s late. A GPU that never suspends (a desktop card,
+  or one driving a display) is read every tick.
 * **NVIDIA (`nvml`):** the device that matches the chosen adapter. On hybrid laptops the
   dGPU sleeps at idle and cannot be read. It then reports 0 with `detail.state = "asleep"`
   and keeps retrying, instead of being dropped for the integrated GPU. Asking a sleeping

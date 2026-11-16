@@ -11,47 +11,33 @@
 //! Reading a powered-down GPU is slow and not free: the driver tries to wake it, which blocks
 //! the call for hundreds of milliseconds and costs kernel CPU time. A read that took
 //! `SLOW_READ` or longer and found the GPU idle or asleep is therefore repeated for
-//! `IDLE_RECHECK` instead of being made again every tick (`Backoff`).
+//! `IDLE_RECHECK` instead of being made again every tick (`sysfs::Backoff`).
+//!
+//! Linux: the GPU's runtime power state is in sysfs and reading it wakes nothing. While it
+//! says `suspended`, NVML is not called at all (`v: 0.0`, `detail.state = "asleep"`). A GPU
+//! that powers down when idle (`sysfs::can_sleep`) is, once read idle, left alone for
+//! `IDLE_RECHECK` so that polling does not keep it awake.
 //!
 //! The device is the one matching the `gpu_adapter` target by name, else the k-th NVIDIA
 //! device where k is the target's position among the NVIDIA adapters detected, else index 0.
 
 use super::adapters::{adapters_detail, Adapter};
+use super::sysfs::{self, Backoff};
 use super::{Ctx, GpuSource};
 use crate::util::{mib, num};
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 use nvml_wrapper::error::NvmlError;
 use nvml_wrapper::Nvml;
 use serde_json::{Map, Value};
-use std::time::{Duration, Instant};
-
-/// A read at least this long means the GPU had to be woken (a normal read is ~1 ms).
-pub(crate) const SLOW_READ: Duration = Duration::from_millis(50);
-/// How long a slow read of an idle GPU is repeated before NVML is asked again.
-pub(crate) const IDLE_RECHECK: Duration = Duration::from_secs(10);
-
-/// Decides when to ask NVML again; between reads the last result is repeated.
-#[derive(Default)]
-pub(crate) struct Backoff {
-    until: Option<Instant>,
-}
-
-impl Backoff {
-    /// Is a real read due at `now`?
-    pub(crate) fn due(&self, now: Instant) -> bool {
-        self.until.is_none_or(|u| now >= u)
-    }
-    /// Record a read that finished at `now`, took `took` and returned utilisation `v`.
-    pub(crate) fn record(&mut self, now: Instant, took: Duration, v: Option<f64>) {
-        let idle = v.is_none_or(|v| v <= 0.0);
-        self.until = (took >= SLOW_READ && idle).then(|| now + IDLE_RECHECK);
-    }
-}
+use std::path::PathBuf;
+use std::time::Instant;
 
 pub struct NvmlSource {
     backoff: Backoff,
     /// The last real read, repeated while `backoff` says not to ask again.
     last: Option<(Option<f64>, Map<String, Value>)>,
+    /// Linux: the device's sysfs directory, for its runtime power state.
+    pm_dev: Option<PathBuf>,
     nvml: Nvml,
     index: u32,
     name: String,
@@ -143,9 +129,14 @@ impl NvmlSource {
             })
             .collect();
         let index = device_for(ctx.target.as_ref(), &ctx.list, &names);
+        let pm_dev = cfg!(target_os = "linux")
+            .then(|| nvml.device_by_index(index).and_then(|d| d.pci_info()).ok())
+            .flatten()
+            .and_then(|p| sysfs::pci_device_dir(std::path::Path::new(sysfs::PCI_ROOT), &p.bus_id));
         Ok(Self {
             backoff: Backoff::default(),
             last: None,
+            pm_dev,
             name: names[index as usize].clone(),
             nvml,
             index,
@@ -161,6 +152,13 @@ impl GpuSource for NvmlSource {
     }
 
     fn read(&mut self) -> (Option<f64>, Map<String, Value>) {
+        if self.pm_dev.as_deref().is_some_and(sysfs::suspended) {
+            // Powered down: asking NVML would wake it.
+            let mut d = self.base_detail();
+            d.insert("state".into(), Value::from("asleep"));
+            d.insert("backend".into(), Value::from(self.backend()));
+            return (Some(0.0), d);
+        }
         let t0 = Instant::now();
         if !self.backoff.due(t0) {
             if let Some(last) = &self.last {
@@ -169,14 +167,17 @@ impl GpuSource for NvmlSource {
         }
         let out = self.read_now();
         let now = Instant::now();
-        self.backoff.record(now, now.duration_since(t0), out.0);
+        let sleeps = self.pm_dev.as_deref().is_some_and(sysfs::can_sleep);
+        self.backoff
+            .record(now, now.duration_since(t0), out.0, sleeps);
         self.last = Some(out.clone());
         out
     }
 }
 
 impl NvmlSource {
-    fn read_now(&mut self) -> (Option<f64>, Map<String, Value>) {
+    /// The detail fields that need no NVML call.
+    fn base_detail(&self) -> Map<String, Value> {
         let mut d = Map::new();
         d.insert("name".into(), Value::from(self.name.clone()));
         d.insert("nvml_index".into(), Value::from(self.index));
@@ -190,6 +191,11 @@ impl NvmlSource {
                 adapters_detail(&self.list, chosen, |_| Map::new()),
             );
         }
+        d
+    }
+
+    fn read_now(&mut self) -> (Option<f64>, Map<String, Value>) {
+        let mut d = self.base_detail();
         let dev = self.nvml.device_by_index(self.index);
         let util = match &dev {
             Ok(dev) => util_or_asleep(dev.utilization_rates().as_ref().map(|u| u.gpu)),
@@ -236,27 +242,6 @@ mod tests {
         }
         let (v, st) = util_or_asleep(Err(&NvmlError::Uninitialized));
         assert_eq!((v, st.unwrap().0), (None, "unreadable"));
-    }
-
-    #[test]
-    fn slow_idle_reads_back_off() {
-        let ms = Duration::from_millis;
-        let t = Instant::now();
-        let mut b = Backoff::default();
-        assert!(b.due(t));
-        // Fast reads, and slow reads of a busy GPU, are made every tick.
-        b.record(t, ms(1), Some(0.0));
-        assert!(b.due(t));
-        b.record(t, ms(400), Some(35.0));
-        assert!(b.due(t));
-        // A slow read of an idle or unreadable GPU is not repeated for IDLE_RECHECK.
-        for v in [Some(0.0), None] {
-            b.record(t, ms(400), v);
-            assert!(!b.due(t + ms(9_999)));
-            assert!(b.due(t + IDLE_RECHECK));
-        }
-        b.record(t, ms(2), Some(0.0));
-        assert!(b.due(t), "a fast read ends the back-off");
     }
 
     #[test]
