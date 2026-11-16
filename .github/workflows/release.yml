@@ -82,6 +82,24 @@ jobs:
     needs: [sender, viewer]
     runs-on: ubuntu-24.04
     steps:
+      # Release notes are the body of the annotated tag's message (everything after its first
+      # line). Create the tag with `git tag -a vX.Y.Z --cleanup=whitespace -F notes.md`:
+      # without --cleanup=whitespace git drops the lines starting with "#" (Markdown headings).
+      # A tag without a body gets GitHub's generated notes instead.
+      - uses: actions/checkout@v4
+      - id: notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # checkout leaves a lightweight copy of the tag; fetch the annotated tag itself.
+          git fetch --quiet --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          git tag -l --format='%(contents:body)' "$TAG" > "$RUNNER_TEMP/notes.md"
+          if grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            echo "generate=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$RUNNER_TEMP/notes.md"
       - uses: actions/download-artifact@v4
         with: { path: assets, merge-multiple: true }
       - run: |
@@ -92,3 +110,5 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: assets/*
+          body_path: ${{ runner.temp }}/notes.md
+          generate_release_notes: ${{ steps.notes.outputs.generate }}
