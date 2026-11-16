@@ -15,6 +15,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const PRINTING_FLAGS: &[&str] = &[
     "--once",
+    "--profile",
     "--print-config",
     "--help",
     "-h",

@@ -39,6 +39,7 @@ pub use mem::MemCollector;
 pub use net::NetCollector;
 pub use temp::TempCollector;
 pub use uptime::UptimeCollector;
+pub use util::{cpu_time, CpuTime, Scope};
 
 /// Metric keys `Collectors::new` knows how to build.
 pub const KNOWN_IDS: &[&str] = &["cpu", "gpu", "mem", "disk", "net", "temp", "load", "uptime"];
@@ -117,9 +118,23 @@ impl Default for CollectorConfig {
     }
 }
 
+/// What one `sample` call of one collector cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cost {
+    /// Metric key, e.g. "gpu".
+    pub id: String,
+    /// Elapsed time of the call.
+    pub wall: Duration,
+    /// CPU time the calling thread used during the call, where it can be measured. Work the
+    /// operating system does on other threads on the collector's behalf is not included.
+    pub cpu: Option<CpuTime>,
+}
+
 /// The enabled set, in config order.
 pub struct Collectors {
     inner: Vec<Box<dyn Collector>>,
+    /// Elapsed time of each collector's most recent `sample`, parallel to `inner`.
+    walls: Vec<Duration>,
 }
 
 impl Collectors {
@@ -166,15 +181,46 @@ impl Collectors {
                 ),
             }
         }
-        Self { inner }
+        let walls = vec![Duration::ZERO; inner.len()];
+        Self { inner, walls }
     }
     /// Sample every collector. Returns `(key, metric)` pairs in config order; collectors that
     /// returned `None` are absent.
     pub fn sample_all(&mut self, dt: Duration) -> Vec<(String, Metric)> {
-        self.inner
-            .iter_mut()
-            .filter_map(|c| c.sample(dt).map(|m| (c.id().to_string(), m)))
-            .collect()
+        let mut out = Vec::with_capacity(self.inner.len());
+        for (c, wall) in self.inner.iter_mut().zip(&mut self.walls) {
+            let t0 = std::time::Instant::now();
+            let m = c.sample(dt);
+            *wall = t0.elapsed();
+            if let Some(m) = m {
+                out.push((c.id().to_string(), m));
+            }
+        }
+        out
+    }
+    /// How long each collector's most recent `sample` took, in config order.
+    pub fn last_walls(&self) -> impl Iterator<Item = (&str, Duration)> {
+        let ids = self.inner.iter().map(|c| c.id());
+        ids.zip(self.walls.iter().copied())
+    }
+    /// Sample every collector like `sample_all`, measuring what each call cost.
+    pub fn sample_profiled(&mut self, dt: Duration) -> Vec<Cost> {
+        let mut out = Vec::with_capacity(self.inner.len());
+        for (c, wall) in self.inner.iter_mut().zip(&mut self.walls) {
+            let cpu0 = cpu_time(Scope::Thread);
+            let t0 = std::time::Instant::now();
+            let _ = c.sample(dt);
+            *wall = t0.elapsed();
+            let cpu = cpu_time(Scope::Thread)
+                .zip(cpu0)
+                .map(|(now, then)| now.since(then));
+            out.push(Cost {
+                id: c.id().to_string(),
+                wall: *wall,
+                cpu,
+            });
+        }
+        out
     }
     pub fn ids(&self) -> Vec<&str> {
         self.inner.iter().map(|c| c.id()).collect()
@@ -189,6 +235,7 @@ impl Collectors {
     /// config keys).
     pub fn push(&mut self, c: Box<dyn Collector>) {
         self.inner.push(c);
+        self.walls.push(Duration::ZERO);
     }
 }
 

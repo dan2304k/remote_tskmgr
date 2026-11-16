@@ -1,8 +1,12 @@
 //! `gpu`: utilisation with a runtime-selected backend.
 //!
-//! `GpuBackend::Auto` tries, in order: NVML (feature `nvml`; libnvidia-ml / nvml.dll is
-//! loaded dynamically so its absence is a soft failure), then on Linux amdgpu sysfs, then
-//! Intel sysfs (frequency only, `v: null`, `approx: true`), then on Windows PDH. A candidate
+//! `GpuBackend::Auto` on Windows tries PDH (the counters Task Manager reads) and then NVML:
+//! the counters come from the Windows graphics scheduler and never touch the GPU, whereas
+//! every NVML query on a hybrid laptop makes the driver power up the sleeping NVIDIA GPU,
+//! which blocks for hundreds of milliseconds and keeps a core busy inside the kernel.
+//! Elsewhere it tries, in order: NVML (feature `nvml`; libnvidia-ml / nvml.dll is loaded
+//! dynamically so its absence is a soft failure), then on Linux amdgpu sysfs, then Intel
+//! sysfs (frequency only, `v: null`, `approx: true`). A candidate
 //! that reports utilisation is chosen if its first read returns a value. If none does, the
 //! first one that initialised is used and the others that initialised are kept as a reserve.
 //!
@@ -124,6 +128,7 @@ impl GpuCollector {
             GpuBackend::Amdgpu => vec![try_amdgpu],
             GpuBackend::Intel => vec![try_intel],
             GpuBackend::Pdh => vec![try_pdh],
+            _ if cfg!(windows) => vec![try_pdh, try_nvml],
             _ => vec![try_nvml, try_amdgpu, try_intel, try_pdh],
         };
         let c = Self::from_candidates(cands, verify, ctx)?;

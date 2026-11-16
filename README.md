@@ -63,6 +63,7 @@ Run:
 rtm-sender                       # broadcasts on all LAN interfaces every 1 s
 rtm-sender --interval 5s         # 100ms | 200ms | 1s | 5s | 15s | 30s (any value 100 ms .. 1 h)
 rtm-sender --once                # print one packet as JSON and exit (for testing)
+rtm-sender --profile             # measure the CPU cost of each enabled metric and exit
 rtm-sender --tcp-unicast 192.168.1.50:48000   # phone on another subnet, or Wi-Fi that drops broadcast
 rtm-sender --print-config        # show the effective config and where the file lives
 ```

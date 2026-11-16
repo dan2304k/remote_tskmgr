@@ -254,6 +254,114 @@ pub fn run_once(cfg: &Config) -> anyhow::Result<String> {
     Ok(p.to_json()?)
 }
 
+/// `--profile` takes this many samples.
+pub const PROFILE_SAMPLES: u32 = 5;
+
+/// One collector's cost summed over the `--profile` samples.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileRow {
+    pub id: String,
+    pub wall: Duration,
+    pub worst: Duration,
+    /// `None` where thread CPU time cannot be measured.
+    pub cpu: Option<rtm_collect::CpuTime>,
+}
+
+/// `--profile`: sample the enabled collectors `PROFILE_SAMPLES` times, one interval apart
+/// (at most 1 s), and report what each one cost. Sends nothing.
+pub fn run_profile(cfg: &Config) -> String {
+    use rtm_collect::{cpu_time, Scope};
+    let gap = interval_of(cfg).min(Duration::from_secs(1));
+    let t = Instant::now();
+    let mut collectors = Collectors::new(&cfg.to_collector_config());
+    prime(&mut collectors, gap);
+    let start_up = t.elapsed();
+
+    let mut rows: Vec<ProfileRow> = Vec::new();
+    let process0 = cpu_time(Scope::Process);
+    let t = Instant::now();
+    for _ in 0..PROFILE_SAMPLES {
+        std::thread::sleep(gap);
+        for (i, c) in collectors.sample_profiled(gap).into_iter().enumerate() {
+            if rows.len() <= i {
+                rows.push(ProfileRow {
+                    id: c.id.clone(),
+                    wall: Duration::ZERO,
+                    worst: Duration::ZERO,
+                    cpu: Some(rtm_collect::CpuTime::default()),
+                });
+            }
+            let r = &mut rows[i];
+            r.wall += c.wall;
+            r.worst = r.worst.max(c.wall);
+            r.cpu = r.cpu.zip(c.cpu).map(|(sum, c)| rtm_collect::CpuTime {
+                kernel: sum.kernel + c.kernel,
+                user: sum.user + c.user,
+            });
+        }
+    }
+    let elapsed = t.elapsed();
+    let process = cpu_time(Scope::Process)
+        .zip(process0)
+        .map(|(now, then)| now.since(then));
+    let head = format!(
+        "rtm-sender {} profile: {PROFILE_SAMPLES} samples, {} ms apart (collector start-up took {} ms)\n\n",
+        env!("CARGO_PKG_VERSION"),
+        gap.as_millis(),
+        start_up.as_millis(),
+    );
+    head + &render_profile(&rows, PROFILE_SAMPLES, elapsed, process)
+}
+
+/// The `--profile` table: per collector the average and worst elapsed time of one sample and
+/// the CPU time of the sampling thread, then the CPU time of the whole process.
+pub fn render_profile(
+    rows: &[ProfileRow],
+    samples: u32,
+    elapsed: Duration,
+    process: Option<rtm_collect::CpuTime>,
+) -> String {
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let per = |d: Duration| ms(d) / f64::from(samples.max(1));
+    let cpu = |c: Option<rtm_collect::CpuTime>| match c {
+        Some(c) => format!("{:>10.2} {:>10.2}", per(c.kernel), per(c.user)),
+        None => format!("{:>10} {:>10}", "-", "-"),
+    };
+    let mut out = format!(
+        "{:<10} {:>10} {:>10} {:>10} {:>10}\n",
+        "ms/sample", "elapsed", "worst", "kernel", "user"
+    );
+    for r in rows {
+        out += &format!(
+            "{:<10} {:>10.2} {:>10.2} {}\n",
+            r.id,
+            per(r.wall),
+            ms(r.worst),
+            cpu(r.cpu)
+        );
+    }
+    if rows.is_empty() {
+        out += "(no metric is enabled)\n";
+    }
+    out += "\nelapsed: how long one sample of that metric takes; kernel/user: CPU time of the\n\
+            sampling thread inside the operating system and in rtm-sender itself.\n";
+    if let Some(p) = process {
+        let secs = elapsed.as_secs_f64().max(1e-3);
+        out += &format!(
+            "\nwhole process over {secs:.1} s: kernel {:.0} ms + user {:.0} ms = {:.1} % of one core\n",
+            ms(p.kernel),
+            ms(p.user),
+            p.total().as_secs_f64() / secs * 100.0
+        );
+    }
+    out
+}
+
+/// A tick whose sampling takes at least this long is reported (see `State::tick`).
+const SLOW_SAMPLE: Duration = Duration::from_millis(100);
+/// ... at most this often.
+const SLOW_LOG_EVERY: Duration = Duration::from_secs(3600);
+
 struct State {
     cfg: Config,
     meta: Meta,
@@ -274,6 +382,8 @@ struct State {
     last_error: Option<String>,
     sent: u64,
     status: Option<SharedStatus>,
+    /// When a slow sample was last logged.
+    slow_logged: Option<Instant>,
 }
 
 impl State {
@@ -301,6 +411,7 @@ impl State {
             last_error: None,
             sent: 0,
             status: None,
+            slow_logged: None,
         })
     }
 
@@ -368,6 +479,24 @@ impl State {
         let dt = now.duration_since(self.last_sample);
         self.last_sample = now;
         let metrics = self.collectors.sample_all(dt);
+        let spent: Duration = self.collectors.last_walls().map(|(_, w)| w).sum();
+        if spent >= SLOW_SAMPLE
+            && self
+                .slow_logged
+                .is_none_or(|t| t.elapsed() >= SLOW_LOG_EVERY)
+        {
+            self.slow_logged = Some(Instant::now());
+            let each: Vec<String> = self
+                .collectors
+                .last_walls()
+                .map(|(id, w)| format!("{id} {} ms", w.as_millis()))
+                .collect();
+            tracing::warn!(
+                "sampling took {} ms ({}); `rtm-sender --profile` shows what each metric costs",
+                spent.as_millis(),
+                each.join(", ")
+            );
+        }
         if self.paused {
             // Sampled only to keep the rate baselines fresh. No packet is built, so `seq` does
             // not advance and the first packet after resuming follows the last one sent.
@@ -926,5 +1055,49 @@ mod tests {
         assert_eq!(p.seq, seq_at_pause + 1, "no gap in seq after resuming");
         tx.send(Control::Shutdown).unwrap();
         h.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn profile_table() {
+        let ms = Duration::from_millis;
+        let rows = [
+            ProfileRow {
+                id: "cpu".into(),
+                wall: ms(10),
+                worst: ms(4),
+                cpu: Some(rtm_collect::CpuTime {
+                    kernel: ms(5),
+                    user: ms(2),
+                }),
+            },
+            ProfileRow {
+                id: "gpu".into(),
+                wall: ms(500),
+                worst: ms(130),
+                cpu: None,
+            },
+        ];
+        let process = rtm_collect::CpuTime {
+            kernel: ms(400),
+            user: ms(100),
+        };
+        let out = render_profile(&rows, 5, Duration::from_secs(5), Some(process));
+        let line = |id: &str| -> Vec<String> {
+            let l = out.lines().find(|l| l.starts_with(id)).unwrap();
+            l.split_whitespace().map(String::from).collect()
+        };
+        assert_eq!(line("cpu"), ["cpu", "2.00", "4.00", "1.00", "0.40"]);
+        assert_eq!(line("gpu"), ["gpu", "100.00", "130.00", "-", "-"]);
+        assert!(out.contains("kernel 400 ms + user 100 ms = 10.0 % of one core"));
+        assert!(render_profile(&[], 5, ms(1), None).contains("no metric is enabled"));
+    }
+
+    #[test]
+    fn profile_runs_on_this_host() {
+        let mut cfg = Config::default();
+        cfg.general.interval_ms = 100;
+        let out = run_profile(&cfg);
+        assert!(out.contains("profile: 5 samples, 100 ms apart"), "{out}");
+        assert!(out.lines().any(|l| l.starts_with("cpu ")), "{out}");
     }
 }

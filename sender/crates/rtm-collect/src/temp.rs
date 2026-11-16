@@ -7,14 +7,24 @@ use crate::util::{detail, num, round};
 use crate::Collector;
 use rtm_protocol::Metric;
 use serde_json::{Map, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::Components;
 
 /// Packet size: the hottest few are what matters.
 const MAX_SENSORS: usize = 6;
 
+/// Windows: how often the sensors are read again. Each read is a WMI query that makes the
+/// kernel evaluate the ACPI thermal zones, which is expensive, and a thermal zone moves
+/// slowly. Elsewhere a read is a few small files and happens every tick.
+const READ_EVERY: Duration = if cfg!(windows) {
+    Duration::from_secs(5)
+} else {
+    Duration::ZERO
+};
+
 pub struct TempCollector {
     comps: Components,
+    read_at: Instant,
 }
 
 impl TempCollector {
@@ -25,7 +35,10 @@ impl TempCollector {
         comps
             .iter()
             .any(|c| valid_temp(c.temperature()).is_some())
-            .then_some(Self { comps })
+            .then(|| Self {
+                comps,
+                read_at: Instant::now(),
+            })
     }
 }
 
@@ -56,7 +69,11 @@ impl Collector for TempCollector {
     }
 
     fn sample(&mut self, _dt: Duration) -> Option<Metric> {
-        self.comps.refresh(false);
+        let now = Instant::now();
+        if now.duration_since(self.read_at) >= READ_EVERY {
+            self.comps.refresh(false);
+            self.read_at = now;
+        }
         let readings: Vec<(String, f64)> = self
             .comps
             .iter()

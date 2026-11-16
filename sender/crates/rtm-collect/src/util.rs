@@ -88,6 +88,98 @@ impl<T: Clone> Hold<T> {
     }
 }
 
+/// CPU time used so far, split into time spent in the kernel and in user code.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CpuTime {
+    pub kernel: Duration,
+    pub user: Duration,
+}
+
+impl CpuTime {
+    /// Time used since `earlier`.
+    pub fn since(self, earlier: CpuTime) -> CpuTime {
+        CpuTime {
+            kernel: self.kernel.saturating_sub(earlier.kernel),
+            user: self.user.saturating_sub(earlier.user),
+        }
+    }
+    pub fn total(self) -> Duration {
+        self.kernel + self.user
+    }
+}
+
+/// Whose CPU time [`cpu_time`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// The calling thread.
+    Thread,
+    /// Every thread of this process.
+    Process,
+}
+
+/// CPU time of the calling thread or the whole process; `None` where it cannot be read.
+#[cfg(windows)]
+pub fn cpu_time(scope: Scope) -> Option<CpuTime> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentThread, GetProcessTimes, GetThreadTimes,
+    };
+    let (mut created, mut exited) = (FILETIME::default(), FILETIME::default());
+    let (mut kernel, mut user) = (FILETIME::default(), FILETIME::default());
+    // SAFETY: the pseudo-handles are always valid; the four out-pointers are valid FILETIMEs.
+    unsafe {
+        match scope {
+            Scope::Thread => GetThreadTimes(
+                GetCurrentThread(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            ),
+            Scope::Process => GetProcessTimes(
+                GetCurrentProcess(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            ),
+        }
+        .ok()?;
+    }
+    // FILETIME counts 100 ns units.
+    let dur = |f: FILETIME| {
+        let units = (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+        Duration::from_nanos(units.saturating_mul(100))
+    };
+    Some(CpuTime {
+        kernel: dur(kernel),
+        user: dur(user),
+    })
+}
+
+/// CPU time of the calling thread or the whole process; `None` where it cannot be read.
+/// Linux reads `/proc`, whose resolution is one clock tick (10 ms).
+#[cfg(not(windows))]
+pub fn cpu_time(scope: Scope) -> Option<CpuTime> {
+    let path = match scope {
+        Scope::Thread => "/proc/thread-self/stat",
+        Scope::Process => "/proc/self/stat",
+    };
+    parse_proc_stat(&std::fs::read_to_string(path).ok()?)
+}
+
+/// `utime` and `stime` (fields 14 and 15, in 10 ms clock ticks) of a `/proc/.../stat` line.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn parse_proc_stat(stat: &str) -> Option<CpuTime> {
+    // The command name (field 2) is in parentheses and may contain spaces.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut f = rest.split_ascii_whitespace().skip(11);
+    let ticks = |s: Option<&str>| Some(Duration::from_millis(s?.parse::<u64>().ok()? * 10));
+    let user = ticks(f.next())?;
+    let kernel = ticks(f.next())?;
+    Some(CpuTime { kernel, user })
+}
+
 pub(crate) fn detail() -> Map<String, Value> {
     Map::new()
 }
@@ -106,6 +198,21 @@ mod tests {
         assert_eq!(h.recent(t + ms(100), ms(200)), Some(7));
         assert_eq!(h.recent(t + ms(199), ms(200)), Some(7));
         assert_eq!(h.recent(t + ms(200), ms(200)), None);
+    }
+
+    #[test]
+    fn proc_stat_cpu_times() {
+        let line = "1234 (my (odd) name) S 1 1234 1234 0 -1 4194560 100 0 0 0 250 75 0 0 20 0 9";
+        let t = parse_proc_stat(line).unwrap();
+        assert_eq!(t.user, Duration::from_millis(2500));
+        assert_eq!(t.kernel, Duration::from_millis(750));
+        assert_eq!(t.total(), Duration::from_millis(3250));
+        let later = CpuTime {
+            kernel: Duration::from_millis(1000),
+            user: Duration::from_millis(2500),
+        };
+        assert_eq!(later.since(t).kernel, Duration::from_millis(250));
+        assert_eq!(parse_proc_stat("garbage"), None);
     }
 
     #[test]

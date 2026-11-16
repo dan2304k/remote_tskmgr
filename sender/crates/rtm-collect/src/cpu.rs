@@ -60,9 +60,19 @@ pub fn cores_detail(usages: &[f64]) -> Vec<(String, Value)> {
     ]
 }
 
+/// How often the clock speed is read again. On Windows that read (`CallNtPowerInformation`)
+/// makes the kernel visit every logical processor, which costs far more than the usage
+/// counters, and the value barely moves; elsewhere it is cheap and read every tick.
+const FREQ_EVERY: Duration = if cfg!(windows) {
+    Duration::from_secs(10)
+} else {
+    Duration::ZERO
+};
+
 pub struct CpuCollector {
     sys: System,
     last_refresh: Instant,
+    last_freq: Instant,
     /// Last valid reading, repeated for ticks closer than `MIN_WINDOW` to it.
     hold: Hold<Metric>,
     /// Only CPU-ish sensors are kept so a tick refreshes just those files.
@@ -83,6 +93,7 @@ impl CpuCollector {
         Some(Self {
             sys,
             last_refresh: Instant::now(),
+            last_freq: Instant::now(),
             hold: Hold::new(),
             components,
         })
@@ -125,7 +136,14 @@ impl Collector for CpuCollector {
             // Only possible before the first valid reading.
             return Some(Metric::percent("CPU", None));
         }
-        self.sys.refresh_cpu_specifics(CpuRefreshKind::everything());
+        let kind = if now.duration_since(self.last_freq) >= FREQ_EVERY {
+            self.last_freq = now;
+            CpuRefreshKind::everything()
+        } else {
+            // The frequencies of the last full refresh stay in place.
+            CpuRefreshKind::nothing().with_usage()
+        };
+        self.sys.refresh_cpu_specifics(kind);
         self.last_refresh = now;
 
         let cpus = self.sys.cpus();

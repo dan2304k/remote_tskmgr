@@ -46,6 +46,7 @@ window opens when it starts at login.
 ```
 rtm-sender                 # run (tray + settings when built with gui)
 rtm-sender --once          # sample once, print the packet JSON, exit
+rtm-sender --profile       # measure what each enabled metric costs to sample, exit
 rtm-sender --print-config  # show the effective config (file + flags), secret masked
 rtm-sender --print-config --show-secret   # ... with the shared secret itself
 rtm-sender --no-gui        # gui build: behave exactly like the headless build
@@ -58,7 +59,7 @@ with comments on first run and hot-reloaded when edited. Command-line flags (`--
 keep overriding it after edits from the GUI.
 
 On Windows the `gui` build attaches to the parent console when started with `--once`,
-`--print-config`, `--help` or `--version`, so their output still appears in the terminal. A
+`--profile`, `--print-config`, `--help` or `--version`, so their output still appears in the terminal. A
 command-line error is printed to the parent console too, or shown in a message box when there
 is none.
 
@@ -260,12 +261,16 @@ heuristic).
   `detail.adapters` gives every card's `busy`, `vram_used_mb` and `vram_total_mb`.
 * **NVIDIA (`nvml`):** the device that matches the chosen adapter. On hybrid laptops the
   dGPU sleeps at idle and cannot be read. It then reports 0 with `detail.state = "asleep"`
-  and keeps retrying, instead of being dropped for the integrated GPU.
+  and keeps retrying, instead of being dropped for the integrated GPU. Asking a sleeping
+  GPU makes the driver wake it, which is slow and costs CPU time, so a read that took 50 ms
+  or more and found the GPU idle is repeated for 10 s before NVML is asked again.
 
 ### Backend choice
 
-`auto` tries NVIDIA (NVML), then AMD and Intel sysfs (Linux), then Windows performance
-counters. In `auto` mode, a backend skips itself if the target adapter is not its vendor's.
+On Windows `auto` uses the Windows performance counters (what Task Manager reads) and falls
+back to NVIDIA (NVML); the counters cost almost nothing and never wake a sleeping GPU. Choose
+`nvml` explicitly if you want the GPU temperature and clock in the detail. On Linux `auto`
+tries NVIDIA (NVML), then AMD and Intel sysfs. In `auto` mode, a backend skips itself if the target adapter is not its vendor's.
 On an all-AMD Windows PC that means the counters are used, and they report the target
 adapter. A backend is chosen if its first reading has a value. A backend that has never
 produced a value may be replaced once by the next one, after 5 empty reads. A backend that

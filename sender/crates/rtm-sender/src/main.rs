@@ -56,7 +56,7 @@ fn main() -> ExitCode {
 /// GUI mode (the `gui` build, except the one-shot `--once` / `--print-config`) also logs to
 /// `sender.log` next to the config.
 fn log_file(cli: &cli::Cli, config: &Path) -> Option<PathBuf> {
-    let gui_mode = cfg!(feature = "gui") && !cli.once && !cli.print_config;
+    let gui_mode = cfg!(feature = "gui") && !cli.one_shot();
     gui_mode.then(|| logging::log_path(config))
 }
 
@@ -70,7 +70,7 @@ fn effective_config(cli: &cli::Cli, mut cfg: Config) -> anyhow::Result<Config> {
 fn real_main(cli: &cli::Cli, path: &Path) -> anyhow::Result<()> {
     let path = path.to_path_buf();
     // Taken before the config is loaded (loading may write it). Not for the one-shot modes.
-    let _instance = if cli.once || cli.print_config {
+    let _instance = if cli.one_shot() {
         None
     } else {
         Some(instance::acquire(&path)?)
@@ -94,6 +94,10 @@ fn real_main(cli: &cli::Cli, path: &Path) -> anyhow::Result<()> {
 
     if cli.once {
         println!("{}", app::run_once(&cfg)?);
+        return Ok(());
+    }
+    if cli.profile {
+        print!("{}", app::run_profile(&cfg));
         return Ok(());
     }
 

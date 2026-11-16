@@ -13,7 +13,7 @@ use crate::Collector;
 use rtm_protocol::Metric;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::{Disk, DiskRefreshKind, Disks};
 
 /// Filesystems that never correspond to a physical block device.
@@ -51,7 +51,15 @@ pub struct DiskCollector {
     clock: Stopwatch,
     /// Last reading, repeated for ticks closer than `MIN_WINDOW` to it.
     hold: Hold<Metric>,
+    /// When the volume list was last enumerated.
+    listed: Instant,
 }
+
+/// Windows: how often the volume list is enumerated again. Enumerating asks the mount
+/// manager and every file system about each volume, so between enumerations a tick only
+/// reads the I/O counters of the volumes already known. A volume that appears is picked up
+/// (and one that disappeared dropped) at the next enumeration.
+const RELIST: Duration = Duration::from_secs(30);
 
 fn refresh_kind() -> DiskRefreshKind {
     DiskRefreshKind::nothing().with_io_usage()
@@ -106,6 +114,7 @@ impl DiskCollector {
             prev: HashMap::new(),
             clock: Stopwatch::new(),
             hold: Hold::new(),
+            listed: Instant::now(),
         };
         // Baseline the counters so the first real sample has something to diff against.
         let totals = me.totals();
@@ -147,12 +156,19 @@ impl Collector for DiskCollector {
     fn sample(&mut self, dt: Duration) -> Option<Metric> {
         // Below MIN_WINDOW since the last reading, repeat it: the counters keep accumulating
         // and the next real reading covers the whole interval (no spikes at 10/s).
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         if let Some(m) = self.hold.recent(now, MIN_WINDOW) {
             return Some(m);
         }
-        // `true` drops unmounted disks; new mounts are picked up by the list refresh.
-        self.disks.refresh_specifics(true, refresh_kind());
+        if cfg!(windows) && now.duration_since(self.listed) < RELIST {
+            for d in self.disks.iter_mut() {
+                d.refresh_specifics(refresh_kind());
+            }
+        } else {
+            // `true` drops unmounted disks; new mounts are picked up by the list refresh.
+            self.disks.refresh_specifics(true, refresh_kind());
+            self.listed = now;
+        }
         let secs = self.clock.lap(dt);
         let totals = self.totals();
 

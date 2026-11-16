@@ -46,6 +46,11 @@ pub struct Cli {
     #[arg(long)]
     pub once: bool,
 
+    /// Measure what each enabled metric costs to sample (5 samples, at most 1 s apart), print
+    /// a table to stdout, exit without sending.
+    #[arg(long, conflicts_with = "once")]
+    pub profile: bool,
+
     /// Do not start the tray icon / settings window; run like the headless build.
     /// Accepted (and ignored) by builds without the `gui` feature.
     #[arg(long)]
@@ -57,6 +62,11 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// A mode that prints something and exits instead of running the daemon.
+    pub fn one_shot(&self) -> bool {
+        self.once || self.profile || self.print_config
+    }
+
     pub fn config_path(&self) -> PathBuf {
         self.config.clone().unwrap_or_else(Config::default_path)
     }
