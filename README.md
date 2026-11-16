@@ -125,6 +125,15 @@ CI (`.github/workflows/ci.yml`) runs all of these on every branch push (Linux + 
 sender, with and without `gui`) and uploads the sender binaries and the debug APK. Tags `v*` publish
 the release assets listed above plus `rtm-viewer.apk` and `SHA256SUMS` (`release.yml`), once every build has succeeded.
 
+The release notes are the body of the annotated tag's message (everything after its first line):
+
+```
+git tag -a v1.2.3 --cleanup=whitespace -F notes.md   # first line: the title, then a blank line, then Markdown
+git push origin v1.2.3
+```
+`--cleanup=whitespace` keeps the lines starting with `#` (Markdown headings), which git would
+otherwise drop. A tag without a body gets GitHub's generated notes.
+
 License: MIT.
 
 ## Attribution
