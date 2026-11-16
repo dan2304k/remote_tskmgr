@@ -1,12 +1,15 @@
 //! amdgpu sysfs backend (Linux): `device/gpu_busy_percent`, `mem_info_vram_{used,total}`,
 //! hwmon `temp1_input` (edge), and the active `pp_dpm_sclk` level for frequency.
 //!
-//! Only the chosen card is read every tick. Reading these files resumes a runtime-suspended
-//! dGPU, so the other cards' `detail.adapters` values are refreshed only every
-//! [`OTHERS_EVERY`] (a sleeping card then wakes briefly every 10 s instead of every tick).
+//! Reading these files resumes a runtime-suspended dGPU, and reading them every tick keeps
+//! an idle one from suspending. So a card whose `power/runtime_status` is `suspended` (a
+//! read that wakes nothing) is not read at all: it reports `v: 0.0` with
+//! `detail.state = "asleep"`. A card that powers down when idle (`sysfs::can_sleep`) is,
+//! once read idle, left alone for `sysfs::IDLE_RECHECK`. The other cards'
+//! `detail.adapters` values are refreshed every [`OTHERS_EVERY`], skipping suspended ones.
 
 use super::adapters::{adapters_detail, from_sysfs, Adapter};
-use super::sysfs::{self, hwmon_temp_path, read_str, read_u64};
+use super::sysfs::{self, hwmon_temp_path, read_str, read_u64, Backoff};
 use super::{Ctx, GpuSource};
 use crate::util::{mib, num, MIB};
 use serde_json::{Map, Value};
@@ -27,6 +30,9 @@ pub struct AmdGpu {
     /// `detail.adapters` extras of the other cards (by id) and when they were read.
     others: HashMap<String, Map<String, Value>>,
     others_at: Option<Instant>,
+    backoff: Backoff,
+    /// The last real read, repeated while `backoff` says not to read again.
+    last: Option<(Option<f64>, Map<String, Value>)>,
 }
 
 impl AmdGpu {
@@ -62,6 +68,8 @@ impl AmdGpu {
             list,
             others: HashMap::new(),
             others_at: None,
+            backoff: Backoff::default(),
+            last: None,
         })
     }
 }
@@ -89,7 +97,9 @@ fn card_extra(root: &Path, a: &Adapter) -> Map<String, Value> {
     let dev = root.join(&a.id).join("device");
     let mut m = Map::new();
     m.insert("card".into(), Value::from(a.id.clone()));
-    if a.vendor == Some(sysfs::VENDOR_AMD) {
+    if sysfs::suspended(&dev) {
+        m.insert("state".into(), Value::from("asleep"));
+    } else if a.vendor == Some(sysfs::VENDOR_AMD) {
         if let Some(b) = read_u64(&dev.join("gpu_busy_percent")) {
             m.insert("busy".into(), Value::from(b.min(100)));
         }
@@ -102,22 +112,50 @@ fn card_extra(root: &Path, a: &Adapter) -> Map<String, Value> {
 
 impl AmdGpu {
     fn read_at(&mut self, now: Instant) -> (Option<f64>, Map<String, Value>) {
-        let busy = read_u64(&self.dev.join("gpu_busy_percent")).map(|v| v.min(100) as f64);
+        let asleep = sysfs::suspended(&self.dev);
+        if !asleep && !self.backoff.due(now) {
+            if let Some(last) = &self.last {
+                return last.clone();
+            }
+        }
+        let out = self.read_now(now, asleep);
+        if !asleep {
+            let took = now.elapsed();
+            let sleeps = sysfs::can_sleep(&self.dev);
+            self.backoff.record(now, took, out.0, sleeps);
+            self.last = Some(out.clone());
+        }
+        out
+    }
+
+    /// `asleep`: the card is powered down; report it idle without reading its files.
+    fn read_now(&mut self, now: Instant, asleep: bool) -> (Option<f64>, Map<String, Value>) {
+        let read = |name: &str| (!asleep).then(|| read_u64(&self.dev.join(name))).flatten();
+        let busy = if asleep {
+            Some(0.0)
+        } else {
+            read("gpu_busy_percent").map(|v| v.min(100) as f64)
+        };
         let mut d = Map::new();
+        if asleep {
+            d.insert("state".into(), Value::from("asleep"));
+        }
         d.insert("name".into(), Value::from(self.adapter.name.clone()));
         d.insert("adapter_index".into(), Value::from(self.adapter.index));
         d.insert("card".into(), Value::from(self.adapter.id.clone()));
-        let used = read_u64(&self.dev.join("mem_info_vram_used"));
-        if let (Some(used), Some(total)) = (used, read_u64(&self.dev.join("mem_info_vram_total"))) {
+        let used = read("mem_info_vram_used");
+        if let (Some(used), Some(total)) = (used, read("mem_info_vram_total")) {
             if total >= MIB {
                 d.insert("vram_used_mb".into(), mib(used));
                 d.insert("vram_total_mb".into(), mib(total));
             }
         }
-        if let Some(t) = self.temp.as_deref().and_then(read_u64) {
+        let temp = self.temp.as_deref().filter(|_| !asleep);
+        if let Some(t) = temp.and_then(read_u64) {
             d.insert("temp_c".into(), num((t as f64 / 1000.0).round()));
         }
-        if let Some(f) = read_str(&self.dev.join("pp_dpm_sclk")).and_then(|s| active_sclk_mhz(&s)) {
+        let sclk = (!asleep).then(|| read_str(&self.dev.join("pp_dpm_sclk")));
+        if let Some(f) = sclk.flatten().and_then(|s| active_sclk_mhz(&s)) {
             d.insert("freq_mhz".into(), Value::from(f));
         }
         if self
@@ -243,6 +281,64 @@ mod tests {
         // File vanishing (GPU reset) gives null, not a panic.
         fs::remove_file(r.join("card2/device/gpu_busy_percent")).unwrap();
         assert_eq!(g.read().0, None);
+    }
+
+    /// A discrete card at card1 that powers down when idle, next to an Intel iGPU.
+    fn sleepy_card(r: &Path, status: &str, busy: &str) {
+        w(r, "card0/device/vendor", "0x8086\n");
+        w(r, "card1/device/vendor", "0x1002\n");
+        w(r, "card1/device/device", "0x73bf\n");
+        w(r, "card1/device/gpu_busy_percent", busy);
+        w(r, "card1/device/power/control", "auto\n");
+        w(r, "card1/device/power/runtime_suspended_time", "5000\n");
+        w(r, "card1/device/power/runtime_status", status);
+    }
+
+    #[test]
+    fn suspended_card_is_reported_idle_without_being_read() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        sleepy_card(r, "active\n", "42\n");
+        let mut g = AmdGpu::probe(r, &Ctx::default()).unwrap();
+        let t0 = Instant::now();
+        assert_eq!(g.read_at(t0).0, Some(42.0));
+        // Suspended: the statistics file is not consulted (it still says 42).
+        w(r, "card1/device/power/runtime_status", "suspended\n");
+        let (v, d) = g.read_at(t0 + Duration::from_secs(1));
+        assert_eq!(v, Some(0.0));
+        assert_eq!(d["state"], "asleep");
+        assert!(!d.contains_key("vram_used_mb"));
+        // Awake again: read at once.
+        w(r, "card1/device/power/runtime_status", "active\n");
+        let (v, d) = g.read_at(t0 + Duration::from_secs(2));
+        assert_eq!(v, Some(42.0));
+        assert!(!d.contains_key("state"));
+    }
+
+    #[test]
+    fn idle_card_that_sleeps_is_left_alone_for_a_while() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        sleepy_card(r, "active\n", "0\n");
+        let mut g = AmdGpu::probe(r, &Ctx::default()).unwrap();
+        let t0 = Instant::now();
+        assert_eq!(g.read_at(t0).0, Some(0.0));
+        // Load starts, but the card is not read again until IDLE_RECHECK has passed.
+        w(r, "card1/device/gpu_busy_percent", "80\n");
+        assert_eq!(g.read_at(t0 + Duration::from_secs(9)).0, Some(0.0));
+        assert_eq!(g.read_at(t0 + sysfs::IDLE_RECHECK).0, Some(80.0));
+        // Busy: read every tick.
+        w(r, "card1/device/gpu_busy_percent", "70\n");
+        let later = t0 + sysfs::IDLE_RECHECK + Duration::from_secs(1);
+        assert_eq!(g.read_at(later).0, Some(70.0));
+
+        // A card that has never suspended (it drives a display) is read every tick.
+        w(r, "card1/device/power/runtime_suspended_time", "0\n");
+        w(r, "card1/device/gpu_busy_percent", "0\n");
+        let later = later + Duration::from_secs(1);
+        assert_eq!(g.read_at(later).0, Some(0.0));
+        w(r, "card1/device/gpu_busy_percent", "5\n");
+        assert_eq!(g.read_at(later + Duration::from_secs(1)).0, Some(5.0));
     }
 
     #[test]
